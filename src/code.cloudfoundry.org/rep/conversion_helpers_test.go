@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/url"
 	"strconv"
+	"time"
 
 	"code.cloudfoundry.org/bbs/models"
 	"code.cloudfoundry.org/bbs/models/test/model_helpers"
@@ -761,6 +762,355 @@ var _ = Describe("Resources", func() {
 					}))
 				})
 			})
+
+			Describe("the execution backend", func() {
+				runRequest := func() executor.RunRequest {
+					runReq, err := runRequestConversionHelper.NewRunRequestFromDesiredLRP(containerGuid, desiredLRP, &actualLRP.ActualLRPKey, &actualLRP.ActualLRPInstanceKey, stackPathMap, rep.LayeringModeSingleLayer)
+					Expect(err).NotTo(HaveOccurred())
+					return runReq
+				}
+
+				Context("when the CF_EXECUTION_BACKEND environment variable is set", func() {
+					BeforeEach(func() {
+						desiredLRP.EnvironmentVariables = append(desiredLRP.EnvironmentVariables,
+							&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "vm-qemu"})
+					})
+
+					It("sets the execution backend on the run info", func() {
+						Expect(runRequest().RunInfo.ExecutionBackend).To(Equal("vm-qemu"))
+					})
+				})
+
+				Context("when the CF_EXECUTION_BACKEND environment variable is set more than once", func() {
+					BeforeEach(func() {
+						desiredLRP.EnvironmentVariables = append(desiredLRP.EnvironmentVariables,
+							&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "gvisor"},
+							&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "vm-qemu"})
+					})
+
+					It("uses the last value", func() {
+						Expect(runRequest().RunInfo.ExecutionBackend).To(Equal("vm-qemu"))
+					})
+				})
+
+				Context("when the CF_EXECUTION_BACKEND environment variable is absent", func() {
+					It("leaves the execution backend empty", func() {
+						Expect(runRequest().RunInfo.ExecutionBackend).To(BeEmpty())
+					})
+				})
+
+				Describe("as Cloud Controller builds the LRP", func() {
+					backendEnv := func(value string) []*models.EnvironmentVariable {
+						return []*models.EnvironmentVariable{
+							{Name: "VCAP_APPLICATION", Value: "{}"},
+							{Name: "CF_EXECUTION_BACKEND", Value: value},
+						}
+					}
+					launcher := func(env ...*models.EnvironmentVariable) *models.RunAction {
+						return &models.RunAction{Path: "/tmp/lifecycle/launcher", Args: []string{"app", "", ""}, Env: env}
+					}
+					wrap := func(action models.ActionInterface) *models.Action { return models.WrapAction(action) }
+
+					BeforeEach(func() {
+						// Cloud Controller puts only LANG in the LRP-level
+						// environment. The app environment lives in the env of
+						// the RunAction that starts the app.
+						desiredLRP.EnvironmentVariables = []*models.EnvironmentVariable{{Name: "LANG", Value: "en_US.UTF-8"}}
+					})
+
+					Context("when the variable is only in the env of the launcher RunAction", func() {
+						BeforeEach(func() {
+							desiredLRP.Action = wrap(launcher(backendEnv("vm-qemu")...))
+						})
+
+						It("selects that backend", func() {
+							Expect(runRequest().RunInfo.ExecutionBackend).To(Equal("vm-qemu"))
+						})
+					})
+
+					Context("when the launcher RunAction is nested in a codependent action", func() {
+						BeforeEach(func() {
+							desiredLRP.Action = wrap(models.Codependent(
+								&models.RunAction{Path: "/tmp/other"},
+								launcher(backendEnv("vm-firecracker")...),
+							))
+						})
+
+						It("selects that backend", func() {
+							Expect(runRequest().RunInfo.ExecutionBackend).To(Equal("vm-firecracker"))
+						})
+					})
+
+					DescribeTable("when the launcher RunAction is nested in a wrapper action",
+						func(build func(inner *models.Action) models.ActionInterface) {
+							desiredLRP.Action = wrap(build(wrap(launcher(backendEnv("gvisor")...))))
+							Expect(runRequest().RunInfo.ExecutionBackend).To(Equal("gvisor"))
+						},
+						Entry("serial", func(inner *models.Action) models.ActionInterface {
+							return &models.SerialAction{Actions: []*models.Action{wrap(&models.RunAction{Path: "/tmp/other"}), inner}}
+						}),
+						Entry("parallel", func(inner *models.Action) models.ActionInterface {
+							return &models.ParallelAction{Actions: []*models.Action{inner}}
+						}),
+						Entry("codependent", func(inner *models.Action) models.ActionInterface {
+							return &models.CodependentAction{Actions: []*models.Action{inner}}
+						}),
+						Entry("timeout", func(inner *models.Action) models.ActionInterface {
+							return models.Timeout(models.UnwrapAction(inner), time.Minute)
+						}),
+						Entry("try", func(inner *models.Action) models.ActionInterface {
+							return &models.TryAction{Action: inner}
+						}),
+						Entry("emit progress", func(inner *models.Action) models.ActionInterface {
+							return &models.EmitProgressAction{Action: inner}
+						}),
+						Entry("every wrapper at once", func(inner *models.Action) models.ActionInterface {
+							return models.Codependent(models.Serial(models.EmitProgressFor(models.Timeout(models.Try(models.Parallel(models.UnwrapAction(inner))), time.Minute), "a", "b", "c")))
+						}),
+					)
+
+					Context("when a RunAction that is not the launcher carries the variable", func() {
+						BeforeEach(func() {
+							desiredLRP.Action = wrap(models.Codependent(
+								&models.RunAction{Path: "/tmp/other", Env: backendEnv("vm-qemu")},
+								launcher(backendEnv("gvisor")...),
+							))
+						})
+
+						It("prefers the launcher RunAction", func() {
+							Expect(runRequest().RunInfo.ExecutionBackend).To(Equal("gvisor"))
+						})
+					})
+
+					Context("when only a RunAction that is not the launcher carries the variable", func() {
+						BeforeEach(func() {
+							desiredLRP.Action = wrap(&models.RunAction{Path: "/tmp/other", Env: backendEnv("vm-qemu")})
+						})
+
+						It("leaves the execution backend empty", func() {
+							Expect(runRequest().RunInfo.ExecutionBackend).To(BeEmpty())
+						})
+					})
+
+					Context("when the launcher RunAction has no variable but the LRP-level environment does", func() {
+						BeforeEach(func() {
+							desiredLRP.Action = wrap(launcher())
+							desiredLRP.EnvironmentVariables = backendEnv("vm-qemu")
+						})
+
+						It("falls back to the LRP-level environment", func() {
+							Expect(runRequest().RunInfo.ExecutionBackend).To(Equal("vm-qemu"))
+						})
+					})
+
+					Context("when the launcher RunAction repeats the variable", func() {
+						BeforeEach(func() {
+							desiredLRP.Action = wrap(launcher(append(backendEnv("gvisor"), backendEnv("vm-qemu")...)...))
+						})
+
+						It("uses the last value", func() {
+							Expect(runRequest().RunInfo.ExecutionBackend).To(Equal("vm-qemu"))
+						})
+					})
+
+					Context("when the action tree is empty or has nil entries", func() {
+						BeforeEach(func() {
+							desiredLRP.Action = wrap(&models.SerialAction{Actions: []*models.Action{nil, {}}})
+						})
+
+						It("leaves the execution backend empty", func() {
+							Expect(runRequest().RunInfo.ExecutionBackend).To(BeEmpty())
+						})
+					})
+
+					Describe("sidecars", func() {
+						sidecarRequest := func() (executor.RunRequest, error) {
+							return runRequestConversionHelper.NewRunRequestFromDesiredLRP(containerGuid, desiredLRP, &actualLRP.ActualLRPKey, &actualLRP.ActualLRPInstanceKey, stackPathMap, rep.LayeringModeSingleLayer)
+						}
+
+						// These names are the kinds guardian's backend package
+						// treats as VMs. A rename or a new kind there has to
+						// change this list and isVMBackend together.
+						DescribeTable("which backend names count as a VM",
+							func(name string, rejected bool) {
+								var env []*models.EnvironmentVariable
+								if name != "" {
+									env = backendEnv(name)
+								}
+								desiredLRP.Action = wrap(launcher(env...))
+								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher(env...))}}
+
+								_, err := sidecarRequest()
+								if rejected {
+									Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
+								} else {
+									Expect(err).NotTo(HaveOccurred())
+								}
+							},
+							Entry("vm-qemu", "vm-qemu", true),
+							Entry("vm-firecracker", "vm-firecracker", true),
+							Entry("oci-gvisor", "oci-gvisor", false),
+							Entry("no backend", "", false),
+						)
+
+						Context("when a launcher sidecar is added to a VM backend LRP", func() {
+							BeforeEach(func() {
+								desiredLRP.Action = wrap(launcher(backendEnv("vm-qemu")...))
+								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher(backendEnv("vm-qemu")...))}}
+							})
+
+							It("fails the conversion naming the sidecar limitation", func() {
+								_, err := sidecarRequest()
+								Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
+								Expect(err).To(MatchError(ContainSubstring("VM execution backends do not support sidecars")))
+							})
+						})
+
+						Context("when the VM backend LRP runs two launcher processes in its action", func() {
+							BeforeEach(func() {
+								desiredLRP.Action = wrap(models.Codependent(
+									launcher(backendEnv("vm-firecracker")...),
+									launcher(backendEnv("vm-firecracker")...),
+								))
+							})
+
+							It("fails the conversion", func() {
+								_, err := sidecarRequest()
+								Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
+							})
+						})
+
+						Context("when the backend comes from the LRP-level environment and a sidecar exists", func() {
+							BeforeEach(func() {
+								desiredLRP.Action = wrap(launcher())
+								desiredLRP.EnvironmentVariables = backendEnv("vm-qemu")
+								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher())}}
+							})
+
+							It("fails the conversion", func() {
+								_, err := sidecarRequest()
+								Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
+							})
+						})
+
+						Context("when a sidecar is not run through the launcher", func() {
+							BeforeEach(func() {
+								desiredLRP.Action = wrap(launcher(backendEnv("vm-qemu")...))
+								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(&models.RunAction{Path: "/tmp/other"})}}
+							})
+
+							It("selects the backend", func() {
+								runReq, err := sidecarRequest()
+								Expect(err).NotTo(HaveOccurred())
+								Expect(runReq.RunInfo.ExecutionBackend).To(Equal("vm-qemu"))
+							})
+						})
+
+						Context("when a gvisor LRP has a launcher sidecar", func() {
+							BeforeEach(func() {
+								desiredLRP.Action = wrap(launcher(backendEnv("gvisor")...))
+								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher(backendEnv("gvisor")...))}}
+							})
+
+							It("selects the backend", func() {
+								runReq, err := sidecarRequest()
+								Expect(err).NotTo(HaveOccurred())
+								Expect(runReq.RunInfo.ExecutionBackend).To(Equal("gvisor"))
+							})
+						})
+
+						Context("when a default-runtime LRP has a launcher sidecar", func() {
+							BeforeEach(func() {
+								desiredLRP.Action = wrap(launcher())
+								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher())}}
+							})
+
+							It("leaves the execution backend empty", func() {
+								runReq, err := sidecarRequest()
+								Expect(err).NotTo(HaveOccurred())
+								Expect(runReq.RunInfo.ExecutionBackend).To(BeEmpty())
+							})
+						})
+					})
+
+					Describe("the rootfs of a VM backend", func() {
+						rootFSRequest := func() (executor.RunRequest, error) {
+							return runRequestConversionHelper.NewRunRequestFromDesiredLRP(containerGuid, desiredLRP, &actualLRP.ActualLRPKey, &actualLRP.ActualLRPInstanceKey, stackPathMap, rep.LayeringModeSingleLayer)
+						}
+
+						BeforeEach(func() {
+							desiredLRP.Sidecars = nil
+						})
+
+						DescribeTable("which rootfs a backend accepts",
+							func(backendName, rootFS string, rejected bool) {
+								desiredLRP.RootFs = rootFS
+								desiredLRP.Action = wrap(launcher(backendEnv(backendName)...))
+
+								runReq, err := rootFSRequest()
+								if rejected {
+									Expect(err).To(MatchError(rep.ErrVMBackendRootFS))
+									Expect(err).To(MatchError(ContainSubstring(fmt.Sprintf("backend %q", backendName))))
+								} else {
+									Expect(err).NotTo(HaveOccurred())
+									Expect(runReq.RunInfo.ExecutionBackend).To(Equal(backendName))
+								}
+							},
+							Entry("vm-qemu with a preloaded stack", "vm-qemu", "preloaded:cflinuxfs3", false),
+							Entry("vm-qemu with a preloaded stack and a droplet layer", "vm-qemu", "preloaded+layer:cflinuxfs3?layer=http://file-server/layer.tgz&layer_digest=some-digest&layer_path=/home/vcap", false),
+							Entry("vm-qemu with a droplet layer below /home/vcap", "vm-qemu", "preloaded+layer:cflinuxfs3?layer=http://file-server/layer.tgz&layer_digest=some-digest&layer_path=/home/vcap/app", false),
+							Entry("vm-qemu with a droplet layer at /etc", "vm-qemu", "preloaded+layer:cflinuxfs3?layer=http://file-server/layer.tgz&layer_digest=some-digest&layer_path=/etc", true),
+							Entry("vm-qemu with a droplet layer escaping /home/vcap", "vm-qemu", "preloaded+layer:cflinuxfs3?layer=http://file-server/layer.tgz&layer_digest=some-digest&layer_path=/home/vcap/../../etc", true),
+							Entry("vm-qemu with a droplet layer and no layer_path", "vm-qemu", "preloaded+layer:cflinuxfs3?layer=http://file-server/layer.tgz&layer_digest=some-digest", true),
+							Entry("vm-firecracker with a preloaded stack", "vm-firecracker", "preloaded:cflinuxfs3", false),
+							Entry("vm-qemu with a docker image", "vm-qemu", "docker:///cloudfoundry/test", true),
+							Entry("vm-firecracker with a docker image", "vm-firecracker", "docker://registry.example.com/cloudfoundry/test", true),
+							Entry("vm-qemu with an unknown scheme", "vm-qemu", "oci:///some/image", true),
+							Entry("vm-qemu with no rootfs", "vm-qemu", "", true),
+							Entry("oci-gvisor with a docker image", "oci-gvisor", "docker:///cloudfoundry/test", false),
+							Entry("no backend with a docker image", "", "docker:///cloudfoundry/test", false),
+						)
+
+						It("names the scheme and never the rootfs URL", func() {
+							desiredLRP.RootFs = "docker://some-user:some-secret@registry.example.com/cloudfoundry/test"
+							desiredLRP.Action = wrap(launcher(backendEnv("vm-qemu")...))
+
+							_, err := rootFSRequest()
+							Expect(err).To(MatchError(ContainSubstring(`rootfs scheme "docker"`)))
+							Expect(err.Error()).NotTo(ContainSubstring("some-secret"))
+							Expect(err.Error()).NotTo(ContainSubstring("registry.example.com"))
+						})
+
+						It("converts a preloaded stack into a preloaded layer in two-layer mode and accepts it", func() {
+							desiredLRP.RootFs = "preloaded:cflinuxfs3"
+							desiredLRP.ImageLayers = []*models.ImageLayer{{
+								Name:            "droplet",
+								Url:             "http://file-server/droplet.tgz",
+								DestinationPath: "/home/vcap",
+								LayerType:       models.LayerTypeExclusive,
+								MediaType:       models.MediaTypeTgz,
+								DigestAlgorithm: models.DigestAlgorithmSha256,
+								DigestValue:     "some-digest",
+							}}
+							desiredLRP.Action = wrap(launcher(backendEnv("vm-qemu")...))
+
+							runReq, err := runRequestConversionHelper.NewRunRequestFromDesiredLRP(containerGuid, desiredLRP, &actualLRP.ActualLRPKey, &actualLRP.ActualLRPInstanceKey, stackPathMap, rep.LayeringModeTwoLayer)
+							Expect(err).NotTo(HaveOccurred())
+							Expect(runReq.RunInfo.RootFSPath).To(HavePrefix("preloaded+layer:"))
+						})
+
+						It("reports the sidecar limitation first when both apply", func() {
+							desiredLRP.RootFs = "docker:///cloudfoundry/test"
+							desiredLRP.Action = wrap(launcher(backendEnv("vm-qemu")...))
+							desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher())}}
+
+							_, err := rootFSRequest()
+							Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
+							Expect(err).NotTo(MatchError(rep.ErrVMBackendRootFS))
+						})
+					})
+				})
+			})
 		})
 
 		Describe("NewRunRequestFromTask", func() {
@@ -1058,6 +1408,69 @@ var _ = Describe("Resources", func() {
 							ChecksumValue:     "some-sha256",
 						}))
 					})
+				})
+			})
+
+			Describe("the execution backend", func() {
+				runRequest := func() executor.RunRequest {
+					runReq, err := runRequestConversionHelper.NewRunRequestFromTask(task, stackPathMap, rep.LayeringModeSingleLayer)
+					Expect(err).NotTo(HaveOccurred())
+					return runReq
+				}
+
+				Context("when the CF_EXECUTION_BACKEND environment variable is set", func() {
+					BeforeEach(func() {
+						task.EnvironmentVariables = append(task.EnvironmentVariables,
+							&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "vm-qemu"})
+					})
+
+					It("sets the execution backend on the run info", func() {
+						Expect(runRequest().RunInfo.ExecutionBackend).To(Equal("vm-qemu"))
+					})
+				})
+
+				Context("when the CF_EXECUTION_BACKEND environment variable is set more than once", func() {
+					BeforeEach(func() {
+						task.EnvironmentVariables = append(task.EnvironmentVariables,
+							&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "gvisor"},
+							&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "vm-qemu"})
+					})
+
+					It("uses the last value", func() {
+						Expect(runRequest().RunInfo.ExecutionBackend).To(Equal("vm-qemu"))
+					})
+				})
+
+				Context("when the CF_EXECUTION_BACKEND environment variable is absent", func() {
+					It("leaves the execution backend empty", func() {
+						Expect(runRequest().RunInfo.ExecutionBackend).To(BeEmpty())
+					})
+				})
+
+				Describe("the rootfs of a VM backend", func() {
+					DescribeTable("which rootfs a backend accepts",
+						func(backendName, rootFS string, rejected bool) {
+							task.RootFs = rootFS
+							task.EnvironmentVariables = append(task.EnvironmentVariables,
+								&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: backendName})
+
+							runReq, err := runRequestConversionHelper.NewRunRequestFromTask(task, stackPathMap, rep.LayeringModeSingleLayer)
+							if rejected {
+								Expect(err).To(MatchError(rep.ErrVMBackendRootFS))
+								Expect(err).To(MatchError(ContainSubstring(fmt.Sprintf("backend %q", backendName))))
+							} else {
+								Expect(err).NotTo(HaveOccurred())
+								Expect(runReq.RunInfo.ExecutionBackend).To(Equal(backendName))
+							}
+						},
+						Entry("vm-qemu with a preloaded stack", "vm-qemu", "preloaded:cflinuxfs3", false),
+						Entry("vm-firecracker with a preloaded stack and a layer", "vm-firecracker", "preloaded+layer:cflinuxfs3?layer=http://file-server/layer.tgz&layer_digest=some-digest&layer_path=/home/vcap", false),
+						Entry("vm-qemu with a docker image", "vm-qemu", "docker:///cloudfoundry/test", true),
+						Entry("vm-firecracker with a docker image", "vm-firecracker", "docker:///cloudfoundry/test", true),
+						Entry("vm-qemu with no rootfs", "vm-qemu", "", true),
+						Entry("oci-gvisor with a docker image", "oci-gvisor", "docker:///cloudfoundry/test", false),
+						Entry("no backend with a docker image", "", "docker:///cloudfoundry/test", false),
+					)
 				})
 			})
 		})

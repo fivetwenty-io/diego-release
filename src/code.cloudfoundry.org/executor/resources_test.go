@@ -107,3 +107,17 @@ var _ = Describe("Container", func() {
 		})
 	})
 })
+
+var _ = Describe("execution backend selection", func() {
+	// These literals are shared with other components. Garden reads the
+	// property key from the container properties, and apps set the environment
+	// variable name. Changing either constant silently sends every workload to
+	// the default runtime, so a rename has to break this test.
+	It("uses the environment variable name apps set", func() {
+		Expect(executor.ExecutionBackendEnvVar).To(Equal("CF_EXECUTION_BACKEND"))
+	})
+
+	It("uses the Garden property key that Garden reads", func() {
+		Expect(executor.ExecutionBackendProperty).To(Equal("garden.execution-backend"))
+	})
+})

@@ -11,6 +11,13 @@ import (
 const (
 	ContainerOwnerProperty = "executor:owner"
 	ContainerStateProperty = "garden.state"
+
+	// ExecutionBackendEnvVar is the app environment variable that selects the
+	// execution backend for a workload.
+	ExecutionBackendEnvVar = "CF_EXECUTION_BACKEND"
+	// ExecutionBackendProperty is the Garden container property that carries the
+	// selected execution backend to the Garden server.
+	ExecutionBackendProperty = "garden.execution-backend"
 )
 
 type State string
@@ -199,6 +206,7 @@ type RunInfo struct {
 	Sidecars                      []Sidecar                   `json:"sidecars"`
 	LogRateLimitBytesPerSecond    int64                       `json:"log_rate_limit_bytes_per_second"`
 	VolumeMountedFiles            []VolumeMountedFiles        `json:"volume_mounted_files,omitempty"`
+	ExecutionBackend              string                      `json:"execution_backend,omitempty"`
 }
 
 type BindMountMode uint8

@@ -134,6 +134,134 @@ var _ = Describe("OrdinaryLRPProcessor", func() {
 					})
 				})
 
+				Context("when the LRP selects a VM backend and has sidecars", func() {
+					BeforeEach(func() {
+						launcher := func(env ...*models.EnvironmentVariable) *models.Action {
+							return models.WrapAction(&models.RunAction{
+								Path: "/tmp/lifecycle/launcher",
+								User: "vcap",
+								Env:  env,
+							})
+						}
+						desiredLRP.Action = launcher(&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "vm-qemu"})
+						desiredLRP.Sidecars = []*models.Sidecar{{Action: launcher()}}
+					})
+
+					It("does not try to run the container", func() {
+						Expect(containerDelegate.RunContainerCallCount()).To(Equal(0))
+					})
+
+					It("crashes the actual LRP with the conversion error as the reason", func() {
+						Expect(bbsClient.CrashActualLRPCallCount()).To(Equal(1))
+						_, traceID, actualLRPKey, instanceKey, reason := bbsClient.CrashActualLRPArgsForCall(0)
+						Expect(traceID).To(Equal("some-trace-id"))
+						Expect(actualLRPKey.ProcessGuid).To(Equal(expectedLrpKey.ProcessGuid))
+						Expect(actualLRPKey.Index).To(Equal(expectedLrpKey.Index))
+						Expect(*instanceKey).To(Equal(expectedInstanceKey))
+						Expect(reason).To(ContainSubstring(rep.ErrVMBackendSidecars.Error()))
+					})
+
+					It("deletes the reserved container", func() {
+						Expect(containerDelegate.DeleteContainerCallCount()).To(Equal(1))
+						delegateLogger, traceID, containerGuid := containerDelegate.DeleteContainerArgsForCall(0)
+						Expect(traceID).To(Equal("some-trace-id"))
+						Expect(containerGuid).To(Equal(container.Guid))
+						Expect(delegateLogger.SessionName()).To(Equal(expectedSessionName))
+					})
+
+					It("does not remove the actual LRP", func() {
+						Expect(bbsClient.RemoveActualLRPCallCount()).To(Equal(0))
+					})
+
+					Context("when crashing the actual LRP fails", func() {
+						BeforeEach(func() {
+							bbsClient.CrashActualLRPReturns(errors.New("boom"))
+						})
+
+						It("still deletes the reserved container", func() {
+							Expect(containerDelegate.DeleteContainerCallCount()).To(Equal(1))
+						})
+					})
+				})
+
+				Context("when the LRP selects a VM backend with a rootfs that is not preloaded", func() {
+					BeforeEach(func() {
+						desiredLRP.RootFs = "docker:///cloudfoundry/test"
+						desiredLRP.Action = models.WrapAction(&models.RunAction{
+							Path: "/tmp/lifecycle/launcher",
+							User: "vcap",
+							Env:  []*models.EnvironmentVariable{{Name: "CF_EXECUTION_BACKEND", Value: "vm-qemu"}},
+						})
+						desiredLRP.Sidecars = nil
+					})
+
+					It("does not try to run the container", func() {
+						Expect(containerDelegate.RunContainerCallCount()).To(Equal(0))
+					})
+
+					It("crashes the actual LRP with the conversion error as the reason", func() {
+						Expect(bbsClient.CrashActualLRPCallCount()).To(Equal(1))
+						_, traceID, actualLRPKey, instanceKey, reason := bbsClient.CrashActualLRPArgsForCall(0)
+						Expect(traceID).To(Equal("some-trace-id"))
+						Expect(actualLRPKey.ProcessGuid).To(Equal(expectedLrpKey.ProcessGuid))
+						Expect(actualLRPKey.Index).To(Equal(expectedLrpKey.Index))
+						Expect(*instanceKey).To(Equal(expectedInstanceKey))
+						Expect(reason).To(ContainSubstring(rep.ErrVMBackendRootFS.Error()))
+						Expect(reason).To(ContainSubstring(`backend "vm-qemu"`))
+					})
+
+					It("deletes the reserved container", func() {
+						Expect(containerDelegate.DeleteContainerCallCount()).To(Equal(1))
+						delegateLogger, traceID, containerGuid := containerDelegate.DeleteContainerArgsForCall(0)
+						Expect(traceID).To(Equal("some-trace-id"))
+						Expect(containerGuid).To(Equal(container.Guid))
+						Expect(delegateLogger.SessionName()).To(Equal(expectedSessionName))
+					})
+
+					It("does not remove the actual LRP", func() {
+						Expect(bbsClient.RemoveActualLRPCallCount()).To(Equal(0))
+					})
+
+					Context("when crashing the actual LRP fails", func() {
+						BeforeEach(func() {
+							bbsClient.CrashActualLRPReturns(errors.New("boom"))
+						})
+
+						It("still deletes the reserved container", func() {
+							Expect(containerDelegate.DeleteContainerCallCount()).To(Equal(1))
+						})
+					})
+				})
+
+				Context("when the LRP selects a gvisor backend with a docker rootfs", func() {
+					BeforeEach(func() {
+						desiredLRP.RootFs = "docker:///cloudfoundry/test"
+						desiredLRP.Action = models.WrapAction(&models.RunAction{
+							Path: "/tmp/lifecycle/launcher",
+							User: "vcap",
+							Env:  []*models.EnvironmentVariable{{Name: "CF_EXECUTION_BACKEND", Value: "oci-gvisor"}},
+						})
+						desiredLRP.Sidecars = nil
+					})
+
+					It("runs the container and does not crash the LRP", func() {
+						Expect(containerDelegate.RunContainerCallCount()).To(Equal(1))
+						Expect(bbsClient.CrashActualLRPCallCount()).To(Equal(0))
+					})
+				})
+
+				Context("when the run request cannot be built for another reason", func() {
+					BeforeEach(func() {
+						desiredLRP.RootFs = "preloaded:unknown-stack"
+					})
+
+					It("neither runs, crashes, nor deletes", func() {
+						Expect(containerDelegate.RunContainerCallCount()).To(Equal(0))
+						Expect(bbsClient.CrashActualLRPCallCount()).To(Equal(0))
+						Expect(containerDelegate.DeleteContainerCallCount()).To(Equal(0))
+					})
+				})
+
 				Context("when claiming succeeds", func() {
 					It("runs the container", func() {
 						Expect(containerDelegate.RunContainerCallCount()).To(Equal(1))

@@ -109,6 +109,65 @@ var _ = Describe("TaskProcessor", func() {
 			})
 		})
 
+		Context("when the task selects a VM backend with a rootfs that is not preloaded", func() {
+			BeforeEach(func() {
+				task.RootFs = "docker:///cloudfoundry/test"
+				task.EnvironmentVariables = append(task.EnvironmentVariables,
+					&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "vm-qemu"})
+			})
+
+			It("does not run the container", func() {
+				Expect(containerDelegate.RunContainerCallCount()).To(Equal(0))
+			})
+
+			It("completes the task with failure and the conversion error as the reason", func() {
+				Expect(bbsClient.CompleteTaskCallCount()).To(Equal(1))
+				_, traceID, guid, cellId, failed, reason, result := bbsClient.CompleteTaskArgsForCall(0)
+				Expect(traceID).To(Equal("some-trace-id"))
+				Expect(guid).To(Equal(taskGuid))
+				Expect(cellId).To(Equal(expectedCellID))
+				Expect(failed).To(BeTrue())
+				Expect(reason).To(ContainSubstring(rep.ErrVMBackendRootFS.Error()))
+				Expect(reason).To(ContainSubstring(`backend "vm-qemu"`))
+				Expect(result).To(BeEmpty())
+			})
+
+			It("deletes the reserved container", func() {
+				Expect(containerDelegate.DeleteContainerCallCount()).To(Equal(1))
+				_, traceID, guid := containerDelegate.DeleteContainerArgsForCall(0)
+				Expect(traceID).To(Equal("some-trace-id"))
+				Expect(guid).To(Equal(taskGuid))
+			})
+
+			Context("when completing the task fails", func() {
+				BeforeEach(func() {
+					bbsClient.CompleteTaskReturns(errors.New("boom"))
+				})
+
+				It("still deletes the reserved container", func() {
+					Expect(containerDelegate.DeleteContainerCallCount()).To(Equal(1))
+				})
+
+				It("does not run the container", func() {
+					Expect(containerDelegate.RunContainerCallCount()).To(Equal(0))
+				})
+			})
+		})
+
+		Context("when the task selects a gvisor backend with a docker rootfs", func() {
+			BeforeEach(func() {
+				task.RootFs = "docker:///cloudfoundry/test"
+				task.EnvironmentVariables = append(task.EnvironmentVariables,
+					&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "oci-gvisor"})
+				containerDelegate.RunContainerReturns(true)
+			})
+
+			It("runs the container and does not complete the task", func() {
+				Expect(containerDelegate.RunContainerCallCount()).To(Equal(1))
+				Expect(bbsClient.CompleteTaskCallCount()).To(Equal(0))
+			})
+		})
+
 		Context("when running the container fails", func() {
 			BeforeEach(func() {
 				containerDelegate.RunContainerReturns(false)

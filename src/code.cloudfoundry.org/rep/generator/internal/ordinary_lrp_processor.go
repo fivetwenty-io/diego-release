@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"errors"
+
 	"code.cloudfoundry.org/bbs"
 	"code.cloudfoundry.org/bbs/models"
 	"code.cloudfoundry.org/ecrhelper"
@@ -95,6 +97,9 @@ func (p *ordinaryLRPProcessor) processReservedContainer(logger lager.Logger, tra
 	runReq, err := p.runRequestConversionHelper.NewRunRequestFromDesiredLRP(lrpContainer.Guid, desired, lrpContainer.ActualLRPKey, lrpContainer.ActualLRPInstanceKey, p.stackPathMap, p.layeringMode)
 	if err != nil {
 		logger.Error("failed-to-construct-run-request", err)
+		if errors.Is(err, rep.ErrVMBackendSidecars) || errors.Is(err, rep.ErrVMBackendRootFS) {
+			p.crashUnrunnableLRP(logger, traceID, lrpContainer, err)
+		}
 		return
 	}
 	ok = p.containerDelegate.RunContainer(logger, traceID, &runReq)
@@ -103,6 +108,19 @@ func (p *ordinaryLRPProcessor) processReservedContainer(logger lager.Logger, tra
 		p.bbsClient.RemoveActualLRP(logger, traceID, lrpContainer.ActualLRPKey, lrpContainer.ActualLRPInstanceKey)
 		return
 	}
+}
+
+// crashUnrunnableLRP reports an LRP that can never run on this cell as crashed,
+// with the conversion error as the failure reason, so the reason reaches the
+// app's instance status and crash events instead of the instance staying
+// claimed until the reservation expires. It then deletes the reserved container.
+func (p *ordinaryLRPProcessor) crashUnrunnableLRP(logger lager.Logger, traceID string, lrpContainer *lrpContainer, reason error) {
+	err := p.bbsClient.CrashActualLRP(logger, traceID, lrpContainer.ActualLRPKey, lrpContainer.ActualLRPInstanceKey, reason.Error())
+	if err != nil {
+		logger.Info("failed-to-crash-actual-lrp", lager.Data{"error": err})
+	}
+
+	p.containerDelegate.DeleteContainer(logger, traceID, lrpContainer.Guid)
 }
 
 func (p *ordinaryLRPProcessor) processInitializingContainer(logger lager.Logger, traceID string, lrpContainer *lrpContainer) {

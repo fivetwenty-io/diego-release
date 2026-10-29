@@ -385,6 +385,9 @@ func (n *storeNode) gardenProperties(container *executor.Container) (garden.Prop
 		return nil, err
 	}
 	properties["log_config"] = string(logConfig)
+	if container.ExecutionBackend != "" {
+		properties[executor.ExecutionBackendProperty] = container.ExecutionBackend
+	}
 
 	return properties, nil
 }

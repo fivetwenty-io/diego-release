@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"errors"
+
 	"code.cloudfoundry.org/bbs"
 	"code.cloudfoundry.org/bbs/models"
 	"code.cloudfoundry.org/ecrhelper"
@@ -85,6 +87,9 @@ func (p *taskProcessor) processActiveContainer(logger lager.Logger, traceID stri
 	runReq, err := p.runRequestConversionHelper.NewRunRequestFromTask(task, p.stackPathMap, p.layeringMode)
 	if err != nil {
 		logger.Error("failed-to-construct-run-request", err)
+		if errors.Is(err, rep.ErrVMBackendRootFS) {
+			p.failUnrunnableTask(logger, traceID, container.Guid, err)
+		}
 		return
 	}
 
@@ -95,6 +100,20 @@ func (p *taskProcessor) processActiveContainer(logger lager.Logger, traceID stri
 			logger.Error("failed-completing-task", err)
 		}
 	}
+}
+
+// failUnrunnableTask completes a task that can never run on this cell as failed,
+// with the conversion error as the failure reason, so the reason reaches the
+// task's result instead of the task staying running until the container is
+// found missing. It then deletes the reserved container, even when completing
+// the task fails.
+func (p *taskProcessor) failUnrunnableTask(logger lager.Logger, traceID, taskGuid string, reason error) {
+	err := p.bbsClient.CompleteTask(logger, traceID, taskGuid, p.cellID, true, reason.Error(), "")
+	if err != nil {
+		logger.Error("failed-completing-task", err)
+	}
+
+	p.containerDelegate.DeleteContainer(logger, traceID, taskGuid)
 }
 
 func (p *taskProcessor) processCompletedContainer(logger lager.Logger, traceID string, container executor.Container) {

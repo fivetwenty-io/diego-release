@@ -602,6 +602,31 @@ var _ = Describe("Container Store", func() {
 				}))
 			})
 
+			Context("when an execution backend is set", func() {
+				BeforeEach(func() {
+					runReq.RunInfo.ExecutionBackend = "vm-qemu"
+				})
+
+				It("sets the execution backend property", func() {
+					_, err := containerStore.Create(logger, "some-trace-id", containerGuid)
+					Expect(err).NotTo(HaveOccurred())
+
+					containerSpec := gardenClient.CreateArgsForCall(0)
+					Expect(containerSpec.Properties).To(HaveKeyWithValue(executor.ExecutionBackendProperty, "vm-qemu"))
+					Expect(executor.ExecutionBackendProperty).To(Equal("garden.execution-backend"))
+				})
+			})
+
+			Context("when no execution backend is set", func() {
+				It("does not set the execution backend property", func() {
+					_, err := containerStore.Create(logger, "some-trace-id", containerGuid)
+					Expect(err).NotTo(HaveOccurred())
+
+					containerSpec := gardenClient.CreateArgsForCall(0)
+					Expect(containerSpec.Properties).NotTo(HaveKey(executor.ExecutionBackendProperty))
+				})
+			})
+
 			Context("if the network is not set", func() {
 				BeforeEach(func() {
 					runReq.RunInfo.Network = nil
