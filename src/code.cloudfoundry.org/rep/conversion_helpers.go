@@ -41,7 +41,9 @@ var (
 	ErrIntergerOverflow     = errors.New("integer overflow")
 
 	// ErrVMBackendSidecars is returned when an LRP that selects a VM execution
-	// backend also runs more than one launcher process.
+	// backend has sidecars or launcher processes that foldVMSidecars cannot
+	// fold into the app's launcher process. The error names the rule that
+	// failed.
 	ErrVMBackendSidecars = errors.New("VM execution backends do not support sidecars")
 
 	// ErrVMBackendRootFS is returned when an LRP or Task that selects a VM
@@ -227,6 +229,19 @@ func (rrch RunRequestConversionHelper) NewRunRequestFromDesiredLRP(
 		return executor.RunRequest{}, err
 	}
 
+	// A VM backend boots one VM per launcher process, so the sidecars travel
+	// inside the app's launcher process and are left out of the run request.
+	action := desiredLRP.Action
+	var sidecars []executor.Sidecar
+	if isVMBackend(executionBackend) && (len(desiredLRP.Sidecars) > 0 || len(launcherRunActions(desiredLRP.Action)) > 1) {
+		action, err = foldVMSidecars(desiredLRP)
+		if err != nil {
+			return executor.RunRequest{}, err
+		}
+	} else {
+		sidecars = convertSidecars(desiredLRP.Sidecars)
+	}
+
 	if err := checkVMBackendRootFS(executionBackend, desiredLRP.RootFs); err != nil {
 		return executor.RunRequest{}, err
 	}
@@ -252,7 +267,7 @@ func (rrch RunRequestConversionHelper) NewRunRequestFromDesiredLRP(
 		Privileged:         desiredLRP.Privileged,
 		CachedDependencies: ConvertCachedDependencies(desiredLRP.CachedDependencies),
 		Setup:              desiredLRP.Setup,
-		Action:             desiredLRP.Action,
+		Action:             action,
 		Monitor:            desiredLRP.Monitor,
 		CheckDefinition:    desiredLRP.CheckDefinition,
 		EgressRules:        desiredLRP.EgressRules,
@@ -269,7 +284,7 @@ func (rrch RunRequestConversionHelper) NewRunRequestFromDesiredLRP(
 		ImageUsername:                 username,
 		ImagePassword:                 password,
 		EnableContainerProxy:          true,
-		Sidecars:                      convertSidecars(desiredLRP.Sidecars),
+		Sidecars:                      sidecars,
 		LogRateLimitBytesPerSecond:    convertLogRateLimit(desiredLRP.LogRateLimit),
 		VolumeMountedFiles:            executor.VolumeMountedFilesFromModel(desiredLRP.VolumeMountedFiles),
 		ExecutionBackend:              executionBackend,
@@ -364,9 +379,9 @@ const cfLauncherPath = "/tmp/lifecycle/launcher"
 // Cloud Controller puts the app environment, which carries the selector, in the
 // env of the RunAction that starts the app, so the action tree is searched
 // first. The LRP-level environment is the fallback for LRPs that were not built
-// by Cloud Controller. It returns ErrVMBackendSidecars when the backend is a VM
-// backend and the LRP runs more than one launcher process, because every
-// launcher process would boot its own VM on the same ports.
+// by Cloud Controller. Sidecars and extra launcher processes do not affect the
+// selection here, because foldVMSidecars decides whether a VM backend LRP can
+// carry them.
 func executionBackendFromLRP(desiredLRP *models.DesiredLRP) (string, error) {
 	launchers := launcherRunActions(desiredLRP.Action)
 	for _, sidecar := range desiredLRP.Sidecars {
@@ -387,9 +402,6 @@ func executionBackendFromLRP(desiredLRP *models.DesiredLRP) (string, error) {
 		backend, _ = lastEnvValue(desiredLRP.EnvironmentVariables, executor.ExecutionBackendEnvVar)
 	}
 
-	if isVMBackend(backend) && len(launchers) > 1 {
-		return "", fmt.Errorf("%w: backend %q, %d launcher processes", ErrVMBackendSidecars, backend, len(launchers))
-	}
 	return backend, nil
 }
 

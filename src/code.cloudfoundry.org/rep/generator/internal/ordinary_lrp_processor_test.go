@@ -136,15 +136,15 @@ var _ = Describe("OrdinaryLRPProcessor", func() {
 
 				Context("when the LRP selects a VM backend and has sidecars", func() {
 					BeforeEach(func() {
-						launcher := func(env ...*models.EnvironmentVariable) *models.Action {
+						launcher := func(user string, env ...*models.EnvironmentVariable) *models.Action {
 							return models.WrapAction(&models.RunAction{
 								Path: "/tmp/lifecycle/launcher",
-								User: "vcap",
+								User: user,
 								Env:  env,
 							})
 						}
-						desiredLRP.Action = launcher(&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "vm-qemu"})
-						desiredLRP.Sidecars = []*models.Sidecar{{Action: launcher()}}
+						desiredLRP.Action = launcher("vcap", &models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "vm-qemu"})
+						desiredLRP.Sidecars = []*models.Sidecar{{Action: launcher("root")}}
 					})
 
 					It("does not try to run the container", func() {

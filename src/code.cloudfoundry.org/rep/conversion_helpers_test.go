@@ -764,6 +764,12 @@ var _ = Describe("Resources", func() {
 			})
 
 			Describe("the execution backend", func() {
+				BeforeEach(func() {
+					// The default sidecars do not run through the launcher, which
+					// a VM backend refuses.
+					desiredLRP.Sidecars = nil
+				})
+
 				runRequest := func() executor.RunRequest {
 					runReq, err := runRequestConversionHelper.NewRunRequestFromDesiredLRP(containerGuid, desiredLRP, &actualLRP.ActualLRPKey, &actualLRP.ActualLRPInstanceKey, stackPathMap, rep.LayeringModeSingleLayer)
 					Expect(err).NotTo(HaveOccurred())
@@ -932,7 +938,7 @@ var _ = Describe("Resources", func() {
 						// treats as VMs. A rename or a new kind there has to
 						// change this list and isVMBackend together.
 						DescribeTable("which backend names count as a VM",
-							func(name string, rejected bool) {
+							func(name string, folded bool) {
 								var env []*models.EnvironmentVariable
 								if name != "" {
 									env = backendEnv(name)
@@ -940,11 +946,12 @@ var _ = Describe("Resources", func() {
 								desiredLRP.Action = wrap(launcher(env...))
 								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher(env...))}}
 
-								_, err := sidecarRequest()
-								if rejected {
-									Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
+								runReq, err := sidecarRequest()
+								Expect(err).NotTo(HaveOccurred())
+								if folded {
+									Expect(runReq.RunInfo.Sidecars).To(BeNil())
 								} else {
-									Expect(err).NotTo(HaveOccurred())
+									Expect(runReq.RunInfo.Sidecars).To(HaveLen(1))
 								}
 							},
 							Entry("vm-qemu", "vm-qemu", true),
@@ -959,10 +966,12 @@ var _ = Describe("Resources", func() {
 								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher(backendEnv("vm-qemu")...))}}
 							})
 
-							It("fails the conversion naming the sidecar limitation", func() {
-								_, err := sidecarRequest()
-								Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
-								Expect(err).To(MatchError(ContainSubstring("VM execution backends do not support sidecars")))
+							It("folds the sidecar into the app's launcher action", func() {
+								runReq, err := sidecarRequest()
+								Expect(err).NotTo(HaveOccurred())
+								Expect(runReq.RunInfo.Sidecars).To(BeNil())
+								run := models.UnwrapAction(runReq.RunInfo.Action).(*models.RunAction)
+								Expect(run.Env[len(run.Env)-1].Name).To(Equal("CF_VM_SIDECARS"))
 							})
 						})
 
@@ -971,6 +980,22 @@ var _ = Describe("Resources", func() {
 								desiredLRP.Action = wrap(models.Codependent(
 									launcher(backendEnv("vm-firecracker")...),
 									launcher(backendEnv("vm-firecracker")...),
+								))
+							})
+
+							It("folds the second one as a sidecar", func() {
+								runReq, err := sidecarRequest()
+								Expect(err).NotTo(HaveOccurred())
+								codependent := models.UnwrapAction(runReq.RunInfo.Action).(*models.CodependentAction)
+								Expect(codependent.Actions).To(HaveLen(1))
+							})
+						})
+
+						Context("when a launcher process is nested in a wrapper of the action", func() {
+							BeforeEach(func() {
+								desiredLRP.Action = wrap(models.Codependent(
+									launcher(backendEnv("vm-firecracker")...),
+									models.Serial(launcher(backendEnv("vm-firecracker")...)),
 								))
 							})
 
@@ -987,9 +1012,11 @@ var _ = Describe("Resources", func() {
 								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher())}}
 							})
 
-							It("fails the conversion", func() {
-								_, err := sidecarRequest()
-								Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
+							It("folds the sidecar", func() {
+								runReq, err := sidecarRequest()
+								Expect(err).NotTo(HaveOccurred())
+								Expect(runReq.RunInfo.ExecutionBackend).To(Equal("vm-qemu"))
+								Expect(runReq.RunInfo.Sidecars).To(BeNil())
 							})
 						})
 
@@ -999,10 +1026,9 @@ var _ = Describe("Resources", func() {
 								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(&models.RunAction{Path: "/tmp/other"})}}
 							})
 
-							It("selects the backend", func() {
-								runReq, err := sidecarRequest()
-								Expect(err).NotTo(HaveOccurred())
-								Expect(runReq.RunInfo.ExecutionBackend).To(Equal("vm-qemu"))
+							It("fails the conversion", func() {
+								_, err := sidecarRequest()
+								Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
 							})
 						})
 
@@ -1102,7 +1128,7 @@ var _ = Describe("Resources", func() {
 						It("reports the sidecar limitation first when both apply", func() {
 							desiredLRP.RootFs = "docker:///cloudfoundry/test"
 							desiredLRP.Action = wrap(launcher(backendEnv("vm-qemu")...))
-							desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher())}}
+							desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(&models.RunAction{Path: "/tmp/other"})}}
 
 							_, err := rootFSRequest()
 							Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
