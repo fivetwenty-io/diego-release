@@ -106,19 +106,63 @@ var _ = Describe("Folding sidecars for a VM backend", func() {
 		It("adds the variable to the app's launcher and drops the sidecar launchers", func() {
 			runReq, err := convert()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(runReq.RunInfo.Sidecars).To(BeNil())
+			Expect(runReq.RunInfo.Sidecars).To(BeEmpty())
 
 			codependent, ok := models.UnwrapAction(runReq.RunInfo.Action).(*models.CodependentAction)
 			Expect(ok).To(BeTrue())
-			Expect(codependent.Actions).To(HaveLen(2))
+			Expect(codependent.Actions).To(HaveLen(4))
 
 			app := models.UnwrapAction(codependent.Actions[0]).(*models.RunAction)
 			Expect(app.Args).To(Equal([]string{"app", "./start", ""}))
-			Expect(app.Env).To(HaveLen(len(appEnv("A", "1", "B", "2")) + 1))
-			Expect(app.Env[len(app.Env)-1].Name).To(Equal("CF_VM_SIDECARS"))
+			Expect(app.Env).To(HaveLen(len(appEnv("A", "1", "B", "2")) + 2))
+			Expect(app.Env[len(app.Env)-2].Name).To(Equal("CF_VM_SIDECARS"))
+			Expect(app.Env[len(app.Env)-1]).To(Equal(&models.EnvironmentVariable{Name: "CF_VM_SIDECAR_RELAY", Value: ""}))
 
-			sshd := models.UnwrapAction(codependent.Actions[1]).(*models.RunAction)
+			sshd := models.UnwrapAction(codependent.Actions[3]).(*models.RunAction)
 			Expect(sshd.Path).To(Equal("/tmp/lifecycle/diego-sshd"))
+		})
+
+		It("keeps each sidecar in place as a relay action", func() {
+			desiredLRP.Action = ccAction(
+				launcher("vcap", "APP/PROC/WEB", []string{"app", "./start", ""}, appEnv("A", "1")),
+				models.WrapAction(&models.RunAction{
+					Path: "/tmp/lifecycle/launcher", Args: []string{"app", "./one", ""}, User: "vcap", LogSource: "APP/PROC/WEB/SIDECAR/ONE",
+					Env:            appEnv("A", "1"),
+					ResourceLimits: &models.ResourceLimits{OptionalNofile: &models.ResourceLimits_Nofile{Nofile: 1024}},
+					Dir:            "/home/vcap/app", SuppressLogOutput: true,
+				}),
+				launcher("vcap", "APP/PROC/WEB/SIDECAR/TWO", []string{"app", "./two", ""}, appEnv("A", "1")),
+			)
+			runReq, err := convert()
+			Expect(err).NotTo(HaveOccurred())
+
+			codependent := models.UnwrapAction(runReq.RunInfo.Action).(*models.CodependentAction)
+			key := descriptionOf(models.UnwrapAction(codependent.Actions[0]).(*models.RunAction))["relay_key"].(string)
+			Expect(key).To(MatchRegexp(`^[0-9a-f]{32}$`))
+
+			one := models.UnwrapAction(codependent.Actions[1]).(*models.RunAction)
+			Expect(one).To(Equal(&models.RunAction{
+				Path: "/tmp/lifecycle/launcher", User: "vcap", LogSource: "APP/PROC/WEB/SIDECAR/ONE",
+				ResourceLimits: &models.ResourceLimits{OptionalNofile: &models.ResourceLimits_Nofile{Nofile: 1024}},
+				Env:            env("CF_VM_SIDECAR_RELAY", "1:"+key),
+			}))
+			two := models.UnwrapAction(codependent.Actions[2]).(*models.RunAction)
+			Expect(two).To(Equal(&models.RunAction{
+				Path: "/tmp/lifecycle/launcher", User: "vcap", LogSource: "APP/PROC/WEB/SIDECAR/TWO",
+				Env: env("CF_VM_SIDECAR_RELAY", "2:"+key),
+			}))
+		})
+
+		It("makes a new key for each call", func() {
+			first, err := convert()
+			Expect(err).NotTo(HaveOccurred())
+			second, err := convert()
+			Expect(err).NotTo(HaveOccurred())
+			keyOf := func(req executor.RunRequest) any {
+				codependent := models.UnwrapAction(req.RunInfo.Action).(*models.CodependentAction)
+				return descriptionOf(models.UnwrapAction(codependent.Actions[0]).(*models.RunAction))["relay_key"]
+			}
+			Expect(keyOf(first)).NotTo(Equal(keyOf(second)))
 		})
 
 		It("encodes each sidecar's arguments and log source", func() {
@@ -127,7 +171,7 @@ var _ = Describe("Folding sidecars for a VM backend", func() {
 
 			codependent := models.UnwrapAction(runReq.RunInfo.Action).(*models.CodependentAction)
 			description := descriptionOf(models.UnwrapAction(codependent.Actions[0]).(*models.RunAction))
-			Expect(description["version"]).To(BeEquivalentTo(1))
+			Expect(description["version"]).To(BeEquivalentTo(2))
 			Expect(description["sidecars"]).To(Equal([]any{
 				map[string]any{
 					"args":       []any{"app", "./one --port 8081", ""},
@@ -166,8 +210,13 @@ var _ = Describe("Folding sidecars for a VM backend", func() {
 			runReq, err := convert()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(runReq.RunInfo.ExecutionBackend).To(Equal("vm-firecracker"))
-			Expect(runReq.RunInfo.Sidecars).To(BeNil())
-			Expect(launcherCount(runReq.RunInfo.Action)).To(Equal(1))
+			Expect(runReq.RunInfo.Sidecars).To(BeEmpty())
+			codependent := models.UnwrapAction(runReq.RunInfo.Action).(*models.CodependentAction)
+			relay := models.UnwrapAction(codependent.Actions[1]).(*models.RunAction)
+			Expect(relay.Args).To(BeEmpty())
+			Expect(relay.Env).To(HaveLen(1))
+			Expect(relay.Env[0].Name).To(Equal("CF_VM_SIDECAR_RELAY"))
+			Expect(relay.Env[0].Value).To(HavePrefix("1:"))
 		})
 	})
 
@@ -177,15 +226,44 @@ var _ = Describe("Folding sidecars for a VM backend", func() {
 			desiredLRP.Sidecars = []*models.Sidecar{sidecarOf(launcher("vcap", "FIELD", []string{"app", "./f", ""}, appEnv()))}
 		})
 
-		It("folds them after the ones in the action", func() {
+		It("folds them after the ones in the action and keeps them as relays in the run request", func() {
 			runReq, err := convert()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(runReq.RunInfo.Sidecars).To(BeNil())
 
 			codependent := models.UnwrapAction(runReq.RunInfo.Action).(*models.CodependentAction)
-			sidecars := descriptionOf(models.UnwrapAction(codependent.Actions[0]).(*models.RunAction))["sidecars"].([]any)
+			description := descriptionOf(models.UnwrapAction(codependent.Actions[0]).(*models.RunAction))
+			sidecars := description["sidecars"].([]any)
 			Expect(sidecars).To(HaveLen(1))
 			Expect(sidecars[0].(map[string]any)["log_source"]).To(Equal("FIELD"))
+
+			Expect(runReq.RunInfo.Sidecars).To(Equal([]executor.Sidecar{{
+				Action: models.WrapAction(&models.RunAction{
+					Path: "/tmp/lifecycle/launcher", User: "vcap", LogSource: "FIELD",
+					Env: env("CF_VM_SIDECAR_RELAY", "1:"+description["relay_key"].(string)),
+				}),
+				MemoryMB: 64,
+				DiskMB:   64,
+			}}))
+		})
+
+		It("counts the field sidecars after the ones in the action", func() {
+			desiredLRP.Action = ccAction(
+				launcher("vcap", "APP/PROC/WEB", []string{"app", "./start", ""}, appEnv()),
+				launcher("vcap", "IN-ACTION", []string{"app", "./a", ""}, appEnv()),
+			)
+			runReq, err := convert()
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(runReq.RunInfo.Sidecars).To(HaveLen(1))
+			relay := models.UnwrapAction(runReq.RunInfo.Sidecars[0].Action).(*models.RunAction)
+			Expect(relay.Env[0].Value).To(HavePrefix("2:"))
+		})
+
+		It("leaves the desired LRP's sidecar unchanged", func() {
+			before := desiredLRP.Copy()
+			_, err := convert()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(desiredLRP).To(Equal(before))
 		})
 	})
 

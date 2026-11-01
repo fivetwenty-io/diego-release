@@ -230,14 +230,17 @@ func (rrch RunRequestConversionHelper) NewRunRequestFromDesiredLRP(
 	}
 
 	// A VM backend boots one VM per launcher process, so the sidecars travel
-	// inside the app's launcher process and are left out of the run request.
+	// inside the app's launcher process, and what stays in the run request is
+	// only the relay that carries each sidecar's output.
 	action := desiredLRP.Action
 	var sidecars []executor.Sidecar
 	if isVMBackend(executionBackend) && (len(desiredLRP.Sidecars) > 0 || len(launcherRunActions(desiredLRP.Action)) > 1) {
-		action, err = foldVMSidecars(desiredLRP)
+		var fieldSidecars []*models.Sidecar
+		action, fieldSidecars, err = foldVMSidecars(desiredLRP)
 		if err != nil {
 			return executor.RunRequest{}, err
 		}
+		sidecars = convertSidecars(fieldSidecars)
 	} else {
 		sidecars = convertSidecars(desiredLRP.Sidecars)
 	}

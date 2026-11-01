@@ -1,6 +1,8 @@
 package rep
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 
@@ -12,9 +14,18 @@ const (
 	// vm-launch, which reads it from the launcher RunAction's environment.
 	vmSidecarsEnvVar = "CF_VM_SIDECARS"
 
+	// vmSidecarRelayEnvVar names the variable that turns a sidecar's process
+	// into a log relay. Its value is <index>:<key>, where the index is the
+	// sidecar's place in the description counted from 1.
+	vmSidecarRelayEnvVar = "CF_VM_SIDECAR_RELAY"
+
 	// vmSidecarsVersion is the version of the description that vm-launch
-	// accepts.
-	vmSidecarsVersion = 1
+	// accepts. Version 2 adds the relay key.
+	vmSidecarsVersion = 2
+
+	// vmSidecarRelayKeyBytes is the size of the random relay key before it is
+	// encoded as hex.
+	vmSidecarRelayKeyBytes = 16
 
 	// maxVMSidecars and maxVMSidecarsBytes bound the description. The byte
 	// limit keeps it well under the 128 KiB that one environment string may
@@ -30,6 +41,7 @@ const cfSSHDPath = "/tmp/lifecycle/diego-sshd"
 // vmSidecarsDescription is the JSON value of CF_VM_SIDECARS.
 type vmSidecarsDescription struct {
 	Version  int         `json:"version"`
+	RelayKey string      `json:"relay_key"`
 	Sidecars []vmSidecar `json:"sidecars"`
 }
 
@@ -44,10 +56,19 @@ type vmSidecar struct {
 }
 
 // foldVMSidecars returns a copy of the LRP's app action whose launcher
-// RunAction carries the sidecars as the CF_VM_SIDECARS variable. A VM backend
-// boots one VM per launcher process, so the sidecars cannot run as Garden
-// processes of their own, and vm-launch starts them next to the app inside the
-// guest instead.
+// RunAction carries the sidecars as the CF_VM_SIDECARS variable, together with
+// a copy of the LRP's Sidecars field. A VM backend boots one VM per launcher
+// process, so the sidecars cannot run as Garden processes of their own, and
+// vm-launch starts them next to the app inside the guest instead.
+//
+// Each sidecar stays in place as a relay action that keeps its path, user, log
+// source, and resource limits, and has no arguments and one variable,
+// CF_VM_SIDECAR_RELAY=<index>:<key>. The executor streams the relay's output
+// under the sidecar's log source, and vm-launch feeds the relay the sidecar's
+// lines. The key is made once for each call and also travels in the
+// description, so only the app's launcher and the relays know it. The app's
+// launcher gets an empty CF_VM_SIDECAR_RELAY, so a value that the user set in
+// the app's environment never turns the app into a relay.
 //
 // Cloud Controller builds the app action as a codependent action whose first
 // launcher RunAction is the app, whose next launcher RunActions are the
@@ -58,18 +79,18 @@ type vmSidecar struct {
 // the app, there are at most eight sidecars, and the encoded description is at
 // most 64 KiB. Every refusal wraps ErrVMBackendSidecars and names the rule that
 // failed. The desired LRP is never changed.
-func foldVMSidecars(desiredLRP *models.DesiredLRP) (*models.Action, error) {
+func foldVMSidecars(desiredLRP *models.DesiredLRP) (*models.Action, []*models.Sidecar, error) {
 	if desiredLRP.Action == nil {
-		return nil, fmt.Errorf("%w: the app has no action", ErrVMBackendSidecars)
+		return nil, nil, fmt.Errorf("%w: the app has no action", ErrVMBackendSidecars)
 	}
 
 	data, err := desiredLRP.Action.Marshal()
 	if err != nil {
-		return nil, fmt.Errorf("copy the app action: %w", err)
+		return nil, nil, fmt.Errorf("copy the app action: %w", err)
 	}
 	folded := &models.Action{}
 	if err := folded.Unmarshal(data); err != nil {
-		return nil, fmt.Errorf("copy the app action: %w", err)
+		return nil, nil, fmt.Errorf("copy the app action: %w", err)
 	}
 
 	// The launchers must be the direct children of one codependent action, or
@@ -89,46 +110,54 @@ func foldVMSidecars(desiredLRP *models.DesiredLRP) (*models.Action, error) {
 			direct = append(direct, run)
 		case ok && run != nil && run.Path == cfSSHDPath:
 		default:
-			return nil, fmt.Errorf("%w: the app action holds a process that is neither the launcher nor the SSH daemon", ErrVMBackendSidecars)
+			return nil, nil, fmt.Errorf("%w: the app action holds a process that is neither the launcher nor the SSH daemon", ErrVMBackendSidecars)
 		}
 	}
 	if len(direct) == 0 {
-		return nil, fmt.Errorf("%w: the app action holds no launcher process", ErrVMBackendSidecars)
+		return nil, nil, fmt.Errorf("%w: the app action holds no launcher process", ErrVMBackendSidecars)
 	}
 	app := direct[0]
 
 	// Each sidecar is a RunAction with a label for its place, such as "sidecar 2".
+	// A sidecar from the Sidecars field also remembers its entry there.
 	type labeled struct {
 		label string
 		run   *models.RunAction
+		field *models.Sidecar
 	}
 	var sidecars []labeled
 	for _, run := range direct[1:] {
-		sidecars = append(sidecars, labeled{fmt.Sprintf("sidecar %d", len(sidecars)+1), run})
+		sidecars = append(sidecars, labeled{label: fmt.Sprintf("sidecar %d", len(sidecars)+1), run: run})
 	}
 	for _, sidecar := range desiredLRP.Sidecars {
 		label := fmt.Sprintf("sidecar %d", len(sidecars)+1)
 		if sidecar == nil || sidecar.Action == nil {
-			return nil, fmt.Errorf("%w: %s has no action", ErrVMBackendSidecars, label)
+			return nil, nil, fmt.Errorf("%w: %s has no action", ErrVMBackendSidecars, label)
 		}
 		run, ok := models.UnwrapAction(sidecar.Action).(*models.RunAction)
 		if !ok || run == nil {
-			return nil, fmt.Errorf("%w: %s is not a single run action", ErrVMBackendSidecars, label)
+			return nil, nil, fmt.Errorf("%w: %s is not a single run action", ErrVMBackendSidecars, label)
 		}
 		if run.Path != cfLauncherPath {
-			return nil, fmt.Errorf("%w: %s does not run through the launcher at %s", ErrVMBackendSidecars, label, cfLauncherPath)
+			return nil, nil, fmt.Errorf("%w: %s does not run through the launcher at %s", ErrVMBackendSidecars, label, cfLauncherPath)
 		}
-		sidecars = append(sidecars, labeled{label, run})
+		sidecars = append(sidecars, labeled{label: label, run: run, field: sidecar})
 	}
 	if len(sidecars) > maxVMSidecars {
-		return nil, fmt.Errorf("%w: the app has %d sidecars, and at most %d are allowed", ErrVMBackendSidecars, len(sidecars), maxVMSidecars)
+		return nil, nil, fmt.Errorf("%w: the app has %d sidecars, and at most %d are allowed", ErrVMBackendSidecars, len(sidecars), maxVMSidecars)
 	}
 
-	description := vmSidecarsDescription{Version: vmSidecarsVersion, Sidecars: make([]vmSidecar, 0, len(sidecars))}
+	keyBytes := make([]byte, vmSidecarRelayKeyBytes)
+	if _, err := rand.Read(keyBytes); err != nil {
+		return nil, nil, fmt.Errorf("make the sidecar relay key: %w", err)
+	}
+	relayKey := hex.EncodeToString(keyBytes)
+
+	description := vmSidecarsDescription{Version: vmSidecarsVersion, RelayKey: relayKey, Sidecars: make([]vmSidecar, 0, len(sidecars))}
 	for _, sidecar := range sidecars {
 		run := sidecar.run
 		if run.User != app.User {
-			return nil, fmt.Errorf("%w: %s runs as user %q, and the app runs as %q", ErrVMBackendSidecars, sidecar.label, run.User, app.User)
+			return nil, nil, fmt.Errorf("%w: %s runs as user %q, and the app runs as %q", ErrVMBackendSidecars, sidecar.label, run.User, app.User)
 		}
 
 		env, unset := vmSidecarEnvDiff(app.Env, run.Env)
@@ -146,26 +175,39 @@ func foldVMSidecars(desiredLRP *models.DesiredLRP) (*models.Action, error) {
 
 	encoded, err := json.Marshal(description)
 	if err != nil {
-		return nil, fmt.Errorf("encode the sidecars: %w", err)
+		return nil, nil, fmt.Errorf("encode the sidecars: %w", err)
 	}
 	if len(encoded) > maxVMSidecarsBytes {
-		return nil, fmt.Errorf("%w: the sidecar description is %d bytes, and at most %d are allowed", ErrVMBackendSidecars, len(encoded), maxVMSidecarsBytes)
+		return nil, nil, fmt.Errorf("%w: the sidecar description is %d bytes, and at most %d are allowed", ErrVMBackendSidecars, len(encoded), maxVMSidecarsBytes)
 	}
 
-	// Drop the sidecar launchers from the codependent action, since vm-launch
-	// starts them, and give the app's launcher the description.
-	if top, ok := models.UnwrapAction(folded).(*models.CodependentAction); ok {
-		kept := make([]*models.Action, 0, len(top.Actions))
-		for _, child := range top.Actions {
-			if run, ok := models.UnwrapAction(child).(*models.RunAction); ok && run != app && run != nil && run.Path == cfLauncherPath {
-				continue
-			}
-			kept = append(kept, child)
+	// Turn each sidecar into its relay action, since vm-launch starts the
+	// sidecar itself. The sidecars in the action are rewritten in place in the
+	// copy, and the ones in the Sidecars field are copied into new entries.
+	var fieldSidecars []*models.Sidecar
+	for i, sidecar := range sidecars {
+		relay := &models.RunAction{
+			Path:           sidecar.run.Path,
+			User:           sidecar.run.User,
+			LogSource:      sidecar.run.LogSource,
+			ResourceLimits: sidecar.run.ResourceLimits,
+			Env:            []*models.EnvironmentVariable{{Name: vmSidecarRelayEnvVar, Value: fmt.Sprintf("%d:%s", i+1, relayKey)}},
 		}
-		top.Actions = kept
+		if sidecar.field == nil {
+			*sidecar.run = *relay
+			continue
+		}
+		copied := *sidecar.field
+		copied.Action = models.WrapAction(relay)
+		fieldSidecars = append(fieldSidecars, &copied)
 	}
-	app.Env = append(app.Env, &models.EnvironmentVariable{Name: vmSidecarsEnvVar, Value: string(encoded)})
-	return folded, nil
+
+	// Give the app's launcher the description and an empty relay variable.
+	app.Env = append(app.Env,
+		&models.EnvironmentVariable{Name: vmSidecarsEnvVar, Value: string(encoded)},
+		&models.EnvironmentVariable{Name: vmSidecarRelayEnvVar, Value: ""},
+	)
+	return folded, fieldSidecars, nil
 }
 
 // vmSidecarEnvDiff compares the last value of each variable. It returns, in

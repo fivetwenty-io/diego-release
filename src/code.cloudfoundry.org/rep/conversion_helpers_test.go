@@ -948,10 +948,16 @@ var _ = Describe("Resources", func() {
 
 								runReq, err := sidecarRequest()
 								Expect(err).NotTo(HaveOccurred())
+								Expect(runReq.RunInfo.Sidecars).To(HaveLen(1))
+								relay, isRun := models.UnwrapAction(runReq.RunInfo.Sidecars[0].Action).(*models.RunAction)
+								Expect(isRun).To(BeTrue())
 								if folded {
-									Expect(runReq.RunInfo.Sidecars).To(BeNil())
+									Expect(relay.Env).To(HaveLen(1))
+									Expect(relay.Env[0].Name).To(Equal("CF_VM_SIDECAR_RELAY"))
 								} else {
-									Expect(runReq.RunInfo.Sidecars).To(HaveLen(1))
+									for _, v := range relay.Env {
+										Expect(v.Name).NotTo(Equal("CF_VM_SIDECAR_RELAY"))
+									}
 								}
 							},
 							Entry("vm-qemu", "vm-qemu", true),
@@ -969,9 +975,9 @@ var _ = Describe("Resources", func() {
 							It("folds the sidecar into the app's launcher action", func() {
 								runReq, err := sidecarRequest()
 								Expect(err).NotTo(HaveOccurred())
-								Expect(runReq.RunInfo.Sidecars).To(BeNil())
+								Expect(runReq.RunInfo.Sidecars).To(HaveLen(1))
 								run := models.UnwrapAction(runReq.RunInfo.Action).(*models.RunAction)
-								Expect(run.Env[len(run.Env)-1].Name).To(Equal("CF_VM_SIDECARS"))
+								Expect(run.Env[len(run.Env)-2].Name).To(Equal("CF_VM_SIDECARS"))
 							})
 						})
 
@@ -987,7 +993,9 @@ var _ = Describe("Resources", func() {
 								runReq, err := sidecarRequest()
 								Expect(err).NotTo(HaveOccurred())
 								codependent := models.UnwrapAction(runReq.RunInfo.Action).(*models.CodependentAction)
-								Expect(codependent.Actions).To(HaveLen(1))
+								Expect(codependent.Actions).To(HaveLen(2))
+								relay := models.UnwrapAction(codependent.Actions[1]).(*models.RunAction)
+								Expect(relay.Env[0].Name).To(Equal("CF_VM_SIDECAR_RELAY"))
 							})
 						})
 
@@ -1016,7 +1024,7 @@ var _ = Describe("Resources", func() {
 								runReq, err := sidecarRequest()
 								Expect(err).NotTo(HaveOccurred())
 								Expect(runReq.RunInfo.ExecutionBackend).To(Equal("vm-qemu"))
-								Expect(runReq.RunInfo.Sidecars).To(BeNil())
+								Expect(runReq.RunInfo.Sidecars).To(HaveLen(1))
 							})
 						})
 
