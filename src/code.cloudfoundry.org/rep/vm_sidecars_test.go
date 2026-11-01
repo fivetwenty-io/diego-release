@@ -221,6 +221,23 @@ var _ = Describe("Folding sidecars for a VM backend", func() {
 		})
 	})
 
+	Context("when a runC LRP has an extra process beside its sidecars", func() {
+		BeforeEach(func() {
+			backend = "oci-gvisor"
+			desiredLRP.Action = models.WrapAction(models.Codependent(
+				models.UnwrapAction(launcher("vcap", "APP/PROC/WEB", []string{"app", "./start", ""}, appEnv())),
+				models.UnwrapAction(launcher("vcap", "S", []string{"app", "./s", ""}, appEnv())),
+				&models.RunAction{Path: "/usr/bin/something", User: "vcap"},
+			))
+		})
+
+		It("leaves the action untouched", func() {
+			runReq, err := convert()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(runReq.RunInfo.Action).To(Equal(desiredLRP.Action))
+		})
+	})
+
 	Context("when a runC LRP has sidecars", func() {
 		BeforeEach(func() {
 			backend = "oci-gvisor"
@@ -248,7 +265,7 @@ var _ = Describe("Folding sidecars for a VM backend", func() {
 				launcher("vcap", "APP/PROC/WEB", []string{"app", "./start", ""}, appEnv()),
 				models.WrapAction(models.Serial(models.UnwrapAction(launcher("vcap", "S", []string{"app", "./s", ""}, appEnv())))),
 			)
-		}, "1 of the 2 launcher processes in the app action are not direct children"),
+		}, "neither the launcher nor the SSH daemon"),
 		Entry("a Sidecars field entry that is a wrapped action", func() {
 			desiredLRP.Sidecars = []*models.Sidecar{sidecarOf(models.WrapAction(models.Serial(models.UnwrapAction(launcher("vcap", "S", []string{"app", "./s", ""}, appEnv())))))}
 		}, "sidecar 3 is not a single run action"),
@@ -258,6 +275,20 @@ var _ = Describe("Folding sidecars for a VM backend", func() {
 		Entry("a Sidecars field entry without an action", func() {
 			desiredLRP.Sidecars = []*models.Sidecar{{}}
 		}, "sidecar 3 has no action"),
+		Entry("an extra run that is neither the launcher nor the SSH daemon", func() {
+			desiredLRP.Action = models.WrapAction(models.Codependent(
+				models.UnwrapAction(launcher("vcap", "APP/PROC/WEB", []string{"app", "./start", ""}, appEnv())),
+				models.UnwrapAction(launcher("vcap", "S", []string{"app", "./s", ""}, appEnv())),
+				&models.RunAction{Path: "/usr/bin/something", User: "vcap"},
+			))
+		}, "neither the launcher nor the SSH daemon"),
+		Entry("a non-run child of the codependent action", func() {
+			desiredLRP.Action = models.WrapAction(models.Codependent(
+				models.UnwrapAction(launcher("vcap", "APP/PROC/WEB", []string{"app", "./start", ""}, appEnv())),
+				models.UnwrapAction(launcher("vcap", "S", []string{"app", "./s", ""}, appEnv())),
+				models.Serial(&models.RunAction{Path: "/tmp/lifecycle/diego-sshd"}),
+			))
+		}, "neither the launcher nor the SSH daemon"),
 		Entry("a sidecar with another user", func() {
 			desiredLRP.Action = ccAction(
 				launcher("vcap", "APP/PROC/WEB", []string{"app", "./start", ""}, appEnv()),
@@ -279,7 +310,7 @@ var _ = Describe("Folding sidecars for a VM backend", func() {
 			)
 		}, "the sidecar description is"),
 		Entry("sidecars without a launcher in the app action", func() {
-			desiredLRP.Action = models.WrapAction(&models.RunAction{Path: "/tmp/other", Env: appEnv()})
+			desiredLRP.Action = ccAction()
 			desiredLRP.EnvironmentVariables = appEnv()
 			desiredLRP.Sidecars = []*models.Sidecar{sidecarOf(launcher("vcap", "S", []string{"app", "./s", ""}, appEnv()))}
 		}, "the app action holds no launcher process"),

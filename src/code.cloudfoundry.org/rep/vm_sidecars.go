@@ -23,6 +23,10 @@ const (
 	maxVMSidecarsBytes = 64 * 1024
 )
 
+// cfSSHDPath is the SSH daemon that Cloud Controller adds beside the app and
+// its sidecars. It stays in the folded action as a Garden process.
+const cfSSHDPath = "/tmp/lifecycle/diego-sshd"
+
 // vmSidecarsDescription is the JSON value of CF_VM_SIDECARS.
 type vmSidecarsDescription struct {
 	Version  int         `json:"version"`
@@ -50,7 +54,7 @@ type vmSidecar struct {
 // sidecars, and whose other children, such as the SSH daemon, are not launcher
 // processes. The fold also takes the sidecars of the LRP's Sidecars field, after
 // those. It succeeds only when the launchers sit directly in that codependent
-// action, every sidecar is a single launcher RunAction run as the same user as
+// action, its only other children are runs of the SSH daemon, every sidecar is a single launcher RunAction run as the same user as
 // the app, there are at most eight sidecars, and the encoded description is at
 // most 64 KiB. Every refusal wraps ErrVMBackendSidecars and names the rule that
 // failed. The desired LRP is never changed.
@@ -79,12 +83,14 @@ func foldVMSidecars(desiredLRP *models.DesiredLRP) (*models.Action, error) {
 	}
 	var direct []*models.RunAction
 	for _, child := range children {
-		if run, ok := models.UnwrapAction(child).(*models.RunAction); ok && run != nil && run.Path == cfLauncherPath {
+		run, ok := models.UnwrapAction(child).(*models.RunAction)
+		switch {
+		case ok && run != nil && run.Path == cfLauncherPath:
 			direct = append(direct, run)
+		case ok && run != nil && run.Path == cfSSHDPath:
+		default:
+			return nil, fmt.Errorf("%w: the app action holds a process that is neither the launcher nor the SSH daemon", ErrVMBackendSidecars)
 		}
-	}
-	if total := len(launcherRunActions(folded)); total != len(direct) {
-		return nil, fmt.Errorf("%w: %d of the %d launcher processes in the app action are not direct children of its codependent action", ErrVMBackendSidecars, total-len(direct), total)
 	}
 	if len(direct) == 0 {
 		return nil, fmt.Errorf("%w: the app action holds no launcher process", ErrVMBackendSidecars)
