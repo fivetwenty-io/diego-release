@@ -475,14 +475,10 @@ func underVCAPHome(layerPath string) bool {
 }
 
 // isVMBackend reports whether the backend name selects a VM execution backend.
-//
-// This is a copy of guardian's backend.IsVM, which the rep cannot import.
-// Change the two together. guardian's backend_test.go enumerates every known
-// kind through IsVM, so adding a kind there fails until it is classified, and
-// the "which backend names count as a VM" spec in conversion_helpers_test.go
-// pins this copy.
+// It delegates to the executor's copy of guardian's backend.IsVM, and the "which
+// backend names count as a VM" spec in conversion_helpers_test.go pins it.
 func isVMBackend(backend string) bool {
-	return backend == "vm-qemu" || backend == "vm-firecracker"
+	return executor.IsVMExecutionBackend(backend)
 }
 
 // launcherRunActions returns, in tree order, every RunAction under the action

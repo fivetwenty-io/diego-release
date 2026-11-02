@@ -154,44 +154,120 @@ var _ = Describe("Transformer", func() {
 		})
 
 		Describe("CF_VM_STOP_GRACE_SECONDS", func() {
-			var actionEnv []string
+			var (
+				envLock sync.Mutex
+				envs    map[string][]string
+			)
+
+			stopGraceVar := func(path string) []string {
+				envLock.Lock()
+				defer envLock.Unlock()
+				var found []string
+				for _, e := range envs[path] {
+					if strings.HasPrefix(e, "CF_VM_STOP_GRACE_SECONDS=") {
+						found = append(found, e)
+					}
+				}
+				return found
+			}
+
+			ranPaths := func() []string {
+				envLock.Lock()
+				defer envLock.Unlock()
+				var paths []string
+				for path := range envs {
+					paths = append(paths, path)
+				}
+				return paths
+			}
+
+			ran := func(path string) func() bool {
+				return func() bool {
+					envLock.Lock()
+					defer envLock.Unlock()
+					_, ok := envs[path]
+					return ok
+				}
+			}
 
 			BeforeEach(func() {
-				actionEnv = nil
+				envLock.Lock()
+				envs = map[string][]string{}
+				envLock.Unlock()
+
+				options = append(options,
+					transformer.WithPostSetupHook("jim", []string{"/post-setup/path"}),
+				)
+				container.Sidecars = []executor.Sidecar{
+					{Action: &models.Action{RunAction: &models.RunAction{Path: "/sidecar-action"}}},
+				}
+
 				gardenContainer.RunStub = func(processSpec garden.ProcessSpec, processIO garden.ProcessIO) (garden.Process, error) {
-					if processSpec.Path == "/action/path" {
-						actionEnv = processSpec.Env
+					envLock.Lock()
+					envs[processSpec.Path] = processSpec.Env
+					envLock.Unlock()
+					if processSpec.Path == "/action/path" || processSpec.Path == "/sidecar-action" || processSpec.Path == "sh" {
+						return makeProcessWithSignal(make(chan int)), nil // block forever but handle signal
 					}
 					return &gardenfakes.FakeProcess{}, nil
 				}
 			})
 
-			runAction := func() {
+			start := func(paths ...string) {
 				runner, _, err := optimusPrime.StepsRunner(logger, container, gardenContainer, logStreamer, cfg)
 				Expect(err).NotTo(HaveOccurred())
-				ifrit.Background(runner)
-				Eventually(func() []string { return actionEnv }).ShouldNot(BeNil())
+				process := ifrit.Background(runner)
+				DeferCleanup(func() { ginkgomon.Interrupt(process) })
+				for _, path := range paths {
+					// The monitor waits on the fake clock, so each poll advances it.
+					Eventually(func() bool {
+						clock.Increment(100 * time.Millisecond)
+						return ran(path)()
+					}).Should(BeTrue(), path)
+				}
 			}
+
+			allPaths := []string{"/setup/path", "/post-setup/path", "/action/path", "/sidecar-action", "/monitor/path"}
 
 			DescribeTable("on a VM backend",
 				func(backend string) {
 					container.ExecutionBackend = backend
-					runAction()
-					Expect(actionEnv).To(ContainElement("CF_VM_STOP_GRACE_SECONDS=10"))
+					start(allPaths...)
+					Expect(stopGraceVar("/action/path")).To(ConsistOf("CF_VM_STOP_GRACE_SECONDS=10"))
+					Expect(stopGraceVar("/setup/path")).To(BeEmpty())
+					Expect(stopGraceVar("/post-setup/path")).To(BeEmpty())
+					Expect(stopGraceVar("/sidecar-action")).To(BeEmpty())
+					Expect(stopGraceVar("/monitor/path")).To(BeEmpty())
 				},
 				Entry("qemu", "vm-qemu"),
 				Entry("firecracker", "vm-firecracker"),
 			)
 
+			Context("when the container proxy is enabled", func() {
+				BeforeEach(func() {
+					options = append(options, transformer.WithContainerProxy(time.Second))
+					container.EnableContainerProxy = true
+					container.ExecutionBackend = "vm-qemu"
+				})
+
+				It("does not reach the container proxy on a VM backend", func() {
+					start("/action/path", "sh")
+					Expect(stopGraceVar("/action/path")).To(ConsistOf("CF_VM_STOP_GRACE_SECONDS=10"))
+					Expect(stopGraceVar("sh")).To(BeEmpty())
+				})
+			})
+
 			DescribeTable("on a container that is not on a VM backend",
 				func(backend string) {
 					container.ExecutionBackend = backend
-					runAction()
-					Expect(actionEnv).NotTo(ContainElement(HavePrefix("CF_VM_STOP_GRACE_SECONDS=")))
+					start(allPaths...)
+					for _, path := range ranPaths() {
+						Expect(stopGraceVar(path)).To(BeEmpty(), path)
+					}
 				},
 				Entry("no backend selected", ""),
-				Entry("runc", "runc"),
-				Entry("gvisor", "gvisor"),
+				Entry("oci-runc", "oci-runc"),
+				Entry("oci-gvisor", "oci-gvisor"),
 			)
 		})
 
@@ -394,7 +470,7 @@ var _ = Describe("Transformer", func() {
 						return actionProcess, nil
 					case spec.Path == "sh" && runtime.GOOS != "windows":
 						return envoyProcess, nil
-					case spec.Path == "/etc/cf-assets/envoy/envoy" && runtime.GOOS == "windows":
+					case spec.Path == "sh" && runtime.GOOS == "windows":
 						return envoyProcess, nil
 					case spec.Path == filepath.Join(transformer.HealthCheckDstPath, "healthcheck"):
 						oldCount := atomic.AddInt64(&healthcheckCallCount, 1)
@@ -486,7 +562,7 @@ var _ = Describe("Transformer", func() {
 				}
 
 				if runtime.GOOS == "windows" {
-					path = "/etc/cf-assets/envoy/envoy"
+					path = "sh"
 					envoyArgs += " --id-creds C:\\etc\\cf-assets\\envoy_config\\sds-id-cert-and-key.yaml"
 					envoyArgs += " --c2c-creds C:\\etc\\cf-assets\\envoy_config\\sds-c2c-cert-and-key.yaml"
 					envoyArgs += " --id-validation C:\\etc\\cf-assets\\envoy_config\\sds-id-validation-context.yaml"
@@ -571,7 +647,7 @@ var _ = Describe("Transformer", func() {
 					}
 
 					if runtime.GOOS == "windows" {
-						path = "/etc/cf-assets/envoy/envoy"
+						path = "sh"
 						envoyArgs += " --id-creds C:\\etc\\cf-assets\\envoy_config\\sds-id-cert-and-key.yaml"
 						envoyArgs += " --c2c-creds C:\\etc\\cf-assets\\envoy_config\\sds-c2c-cert-and-key.yaml"
 						envoyArgs += " --id-validation C:\\etc\\cf-assets\\envoy_config\\sds-id-validation-context.yaml"

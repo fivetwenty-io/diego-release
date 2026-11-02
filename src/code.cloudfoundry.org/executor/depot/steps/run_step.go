@@ -118,7 +118,9 @@ func (step *runStep) Run(signals <-chan os.Signal, ready chan<- struct{}) error 
 
 	envVars = append(envVars, step.networkingEnvVars()...)
 
-	if seconds := int(step.gracefulShutdownInterval / time.Second); step.passStopGrace && seconds > 0 {
+	if step.passStopGrace && step.gracefulShutdownInterval > 0 {
+		// A positive interval under one second still counts as one second.
+		seconds := max(1, int(step.gracefulShutdownInterval/time.Second))
 		envVars = append(envVars, fmt.Sprintf("%s=%d", executor.StopGraceSecondsEnvVar, seconds))
 	}
 

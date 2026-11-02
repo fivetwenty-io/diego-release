@@ -894,6 +894,17 @@ var _ = Describe("RunStep with the stop grace interval", func() {
 		Expect(spec.Env).To(ContainElement("CF_VM_STOP_GRACE_SECONDS=15"))
 	})
 
+	Context("when the interval is a positive fraction of a second", func() {
+		BeforeEach(func() {
+			interval = 400 * time.Millisecond
+		})
+
+		It("passes one second", func() {
+			_, spec, _ := gardenClient.Connection.RunArgsForCall(0)
+			Expect(spec.Env).To(ContainElement("CF_VM_STOP_GRACE_SECONDS=1"))
+		})
+	})
+
 	Context("when the interval is zero", func() {
 		BeforeEach(func() {
 			interval = 0

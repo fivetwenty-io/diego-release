@@ -403,14 +403,6 @@ func (t *transformer) StepsRunner(
 	var setup, action, postSetup, monitor, readinessMonitor, longLivedAction ifrit.Runner
 	var substeps []ifrit.Runner
 
-	if executor.IsVMExecutionBackend(container.ExecutionBackend) {
-		// The transformer is shared by every container, so a VM container gets
-		// its own copy that tells run steps to pass the stop grace interval.
-		vmTransformer := *t
-		vmTransformer.passStopGrace = true
-		t = &vmTransformer
-	}
-
 	if container.Setup != nil {
 		setup = t.stepFor(
 			logStreamer,
@@ -455,7 +447,17 @@ func (t *transformer) StepsRunner(
 		return nil, nil, err
 	}
 
-	action = t.stepFor(
+	// Only the launcher reads the stop grace interval, so only the main action
+	// of a VM container passes it. The transformer is shared by every
+	// container, so the action gets its own copy that sets the flag.
+	actionTransformer := t
+	if executor.IsVMExecutionBackend(container.ExecutionBackend) {
+		vmTransformer := *t
+		vmTransformer.passStopGrace = true
+		actionTransformer = &vmTransformer
+	}
+
+	action = actionTransformer.stepFor(
 		logStreamer,
 		container.Action,
 		gardenContainer,
