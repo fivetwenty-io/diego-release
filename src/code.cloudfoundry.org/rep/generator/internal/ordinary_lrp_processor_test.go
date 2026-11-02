@@ -186,7 +186,7 @@ var _ = Describe("OrdinaryLRPProcessor", func() {
 
 				Context("when the LRP selects a VM backend with a rootfs that is not preloaded", func() {
 					BeforeEach(func() {
-						desiredLRP.RootFs = "docker:///cloudfoundry/test"
+						desiredLRP.RootFs = "oci:///some/image"
 						desiredLRP.Action = models.WrapAction(&models.RunAction{
 							Path: "/tmp/lifecycle/launcher",
 							User: "vcap",

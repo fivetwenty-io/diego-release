@@ -111,7 +111,7 @@ var _ = Describe("TaskProcessor", func() {
 
 		Context("when the task selects a VM backend with a rootfs that is not preloaded", func() {
 			BeforeEach(func() {
-				task.RootFs = "docker:///cloudfoundry/test"
+				task.RootFs = "oci:///some/image"
 				task.EnvironmentVariables = append(task.EnvironmentVariables,
 					&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "vm-qemu"})
 			})
