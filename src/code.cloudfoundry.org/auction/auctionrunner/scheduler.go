@@ -1,11 +1,13 @@
 package auctionrunner
 
 import (
+	"errors"
 	"sort"
 	"sync"
 
 	"code.cloudfoundry.org/auction/auctiontypes"
 	"code.cloudfoundry.org/bbs/models"
+	"code.cloudfoundry.org/rep"
 
 	"code.cloudfoundry.org/clock"
 	"code.cloudfoundry.org/lager/v3"
@@ -14,9 +16,13 @@ import (
 
 type Zone []*Cell
 
-func (z *Zone) filterCells(pc models.PlacementConstraint) ([]*Cell, error) {
+// filterCells returns the cells that match the placement constraint and that
+// offer and accept the execution backend. taskDomain is empty for an LRP. The
+// error describes the furthest check that some cell passed.
+func (z *Zone) filterCells(pc models.PlacementConstraint, backend, taskDomain string) ([]*Cell, error) {
 	var cells = make([]*Cell, 0, len(*z))
 	err := auctiontypes.ErrorCellMismatch
+	required := map[string]struct{}{}
 
 	for _, cell := range *z {
 		if cell.MatchRootFS(pc.RootFs) {
@@ -30,14 +36,71 @@ func (z *Zone) filterCells(pc models.PlacementConstraint) ([]*Cell, error) {
 				}
 
 				if cell.MatchPlacementTags(pc.PlacementTags) {
-					err = nil
-					cells = append(cells, cell)
+					backendErr := cell.MatchExecutionBackend(backend, taskDomain)
+					if backendErr == nil {
+						err = nil
+						cells = append(cells, cell)
+						continue
+					}
+
+					if errors.Is(backendErr, rep.ErrExecutionBackendNotAccepted) {
+						for _, name := range cell.RequiredExecutionBackends() {
+							required[name] = struct{}{}
+						}
+					}
+					if err != nil {
+						err = newExecutionBackendMismatchError(backend, required)
+					}
 				}
 			}
 		}
 	}
 
 	return cells, err
+}
+
+func newExecutionBackendMismatchError(backend string, required map[string]struct{}) auctiontypes.ExecutionBackendMismatchError {
+	if backend == "" {
+		backend = rep.DefaultExecutionBackend
+	}
+	mismatch := auctiontypes.ExecutionBackendMismatchError{Backend: backend}
+	for name := range required {
+		mismatch.Required = append(mismatch.Required, name)
+	}
+	sort.Strings(mismatch.Required)
+	return mismatch
+}
+
+// furtherPlacementError returns the error that describes the furthest check
+// that a cell in some zone passed. An execution backend mismatch comes after
+// every other check, and two of them combine the backends the cells require.
+// The other errors keep the precedence they have always had.
+func furtherPlacementError(zoneError, err error) error {
+	backendErr, isBackendErr := err.(auctiontypes.ExecutionBackendMismatchError)
+	zoneBackendErr, isZoneBackendErr := zoneError.(auctiontypes.ExecutionBackendMismatchError)
+
+	switch {
+	case isBackendErr && isZoneBackendErr:
+		required := map[string]struct{}{}
+		for _, name := range append(zoneBackendErr.Required, backendErr.Required...) {
+			required[name] = struct{}{}
+		}
+		return newExecutionBackendMismatchError(backendErr.Backend, required)
+	case isBackendErr:
+		return err
+	case isZoneBackendErr:
+		return zoneError
+	}
+
+	_, isZoneErrorPlacementTagMismatchError := zoneError.(auctiontypes.PlacementTagMismatchError)
+	_, isErrPlacementTagMismatchError := err.(auctiontypes.PlacementTagMismatchError)
+
+	if isZoneErrorPlacementTagMismatchError ||
+		(zoneError == auctiontypes.ErrorVolumeDriverMismatch && isErrPlacementTagMismatchError) ||
+		zoneError == auctiontypes.ErrorCellMismatch || zoneError == nil {
+		return err
+	}
+	return zoneError
 }
 
 func (z Zone) Len() int      { return len(z) }
@@ -356,16 +419,9 @@ func (s *Scheduler) scheduleTaskAuction(taskAuction *auctiontypes.TaskAuction, s
 	var zoneError error
 
 	for _, zone := range s.zones {
-		cells, err := zone.filterCells(taskAuction.PlacementConstraint)
+		cells, err := zone.filterCells(taskAuction.PlacementConstraint, taskAuction.ExecutionBackend, taskAuction.Domain)
 		if err != nil {
-			_, isZoneErrorPlacementTagMismatchError := zoneError.(auctiontypes.PlacementTagMismatchError)
-			_, isErrPlacementTagMismatchError := err.(auctiontypes.PlacementTagMismatchError)
-
-			if isZoneErrorPlacementTagMismatchError ||
-				(zoneError == auctiontypes.ErrorVolumeDriverMismatch && isErrPlacementTagMismatchError) ||
-				zoneError == auctiontypes.ErrorCellMismatch || zoneError == nil {
-				zoneError = err
-			}
+			zoneError = furtherPlacementError(zoneError, err)
 			continue
 		}
 

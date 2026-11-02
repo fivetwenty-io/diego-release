@@ -82,6 +82,33 @@ properties:
   diego.rep.optional_placement_tags:
     description: "Array of optional tags used for scheduling Tasks and LRPs"
     default: []
+  diego.rep.execution_backends:
+    description: |
+      Execution backends this cell offers in addition to the always-available
+      oci-runc. Allowed entries are oci-gvisor, vm-qemu, and vm-firecracker.
+      Set it to the same list as garden.execution_backends on this cell. The
+      rep advertises the list in its cell presence, the auctioneer places a
+      workload that selects a backend only on a cell that offers it, and the
+      rep refuses any other workload that selects a backend it does not offer.
+    default: []
+  diego.rep.required_execution_backends:
+    description: |
+      When not empty, this cell runs only workloads that select one of these
+      execution backends, so an operator can require VM isolation for the
+      isolation segment the cell belongs to. Allowed entries are oci-runc,
+      oci-gvisor, vm-qemu, and vm-firecracker, and every entry other than
+      oci-runc must also be in diego.rep.execution_backends. A workload that
+      selects another backend, or none, fails placement with an error that
+      names the required backends.
+    default: []
+  diego.rep.required_execution_backends_exempt_task_domains:
+    description: |
+      Task domains that diego.rep.required_execution_backends does not apply
+      to. A task in one of these domains may select any offered backend, or
+      none. Cloud Controller stages apps in the cf-app-staging domain without
+      selecting a backend, so leaving it here lets apps in a segment that
+      requires a VM backend still stage there.
+    default: ["cf-app-staging"]
   diego.rep.cell_annotations:
     description: "Map of string key-value annotations to attach to the cell presence. A deployment_guid key set to the BOSH deployment name is automatically added."
     default: {}

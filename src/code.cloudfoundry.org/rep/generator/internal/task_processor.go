@@ -31,8 +31,8 @@ type taskProcessor struct {
 	runRequestConversionHelper rep.RunRequestConversionHelper
 }
 
-func NewTaskProcessor(bbs bbs.InternalClient, containerDelegate ContainerDelegate, cellID string, stackPathMap rep.StackPathMap, layeringMode string) TaskProcessor {
-	runRequestConversionHelper := rep.RunRequestConversionHelper{ECRHelper: ecrhelper.NewECRHelper()}
+func NewTaskProcessor(bbs bbs.InternalClient, containerDelegate ContainerDelegate, cellID string, stackPathMap rep.StackPathMap, layeringMode string, executionBackendPolicy *rep.ExecutionBackendPolicy) TaskProcessor {
+	runRequestConversionHelper := rep.RunRequestConversionHelper{ECRHelper: ecrhelper.NewECRHelper(), ExecutionBackendPolicy: executionBackendPolicy}
 
 	return &taskProcessor{
 		bbsClient:                  bbs,
@@ -87,7 +87,7 @@ func (p *taskProcessor) processActiveContainer(logger lager.Logger, traceID stri
 	runReq, err := p.runRequestConversionHelper.NewRunRequestFromTask(task, p.stackPathMap, p.layeringMode)
 	if err != nil {
 		logger.Error("failed-to-construct-run-request", err)
-		if errors.Is(err, rep.ErrVMBackendRootFS) {
+		if errors.Is(err, rep.ErrVMBackendRootFS) || rep.IsExecutionBackendPolicyError(err) {
 			p.failUnrunnableTask(logger, traceID, container.Guid, err)
 		}
 		return

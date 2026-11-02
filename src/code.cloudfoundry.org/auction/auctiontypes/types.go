@@ -7,6 +7,7 @@ import (
 
 	bbsmodels "code.cloudfoundry.org/bbs/models"
 	"code.cloudfoundry.org/lager/v3"
+	"code.cloudfoundry.org/rep"
 	"github.com/tedsuo/ifrit"
 )
 
@@ -40,6 +41,22 @@ func (e PlacementTagMismatchError) Error() string {
 	}
 }
 
+// ExecutionBackendMismatchError is the placement error for a workload whose
+// execution backend no cell offers or accepts, among the cells that match its
+// rootfs, volume drivers, and placement tags. Required lists the backends that
+// such cells require when they offer the backend but do not accept it.
+type ExecutionBackendMismatchError struct {
+	Backend  string
+	Required []string
+}
+
+func (e ExecutionBackendMismatchError) Error() string {
+	if len(e.Required) == 0 {
+		return "found no compatible cell offering execution backend \"" + e.Backend + "\""
+	}
+	return "found no compatible cell accepting execution backend \"" + e.Backend + "\", the matching cells require " + rep.QuoteExecutionBackends(e.Required)
+}
+
 var ErrorNothingToStop = errors.New("nothing to stop")
 var ErrorCellCommunication = errors.New("unable to communicate to compatible cells")
 var ErrorExceededInflightCreation = errors.New("waiting to start instance: reached in-flight start limit")
@@ -54,6 +71,11 @@ type AuctionRunner interface {
 type AuctionRunnerDelegate interface {
 	FetchCellReps(lager.Logger, string) (map[string]bbsmodels.RepClient, error)
 	AuctionCompleted(lager.Logger, string, AuctionResults)
+
+	// ResolveExecutionBackends sets the ExecutionBackend of every auction to
+	// the backend that its workload selects. When it cannot tell, it sets the
+	// auction's PlacementError instead, and the auction is not scheduled.
+	ResolveExecutionBackends(logger lager.Logger, traceID string, lrps []LRPAuction, tasks []TaskAuction)
 }
 
 //go:generate counterfeiter -o fakes/fake_metric_emitter.go . AuctionMetricEmitterDelegate
@@ -91,34 +113,41 @@ func NewAuctionRecord(now time.Time) AuctionRecord {
 	return AuctionRecord{QueueTime: now}
 }
 
+// LRPAuction is one LRP instance to place. ExecutionBackend is the backend
+// that the LRP selects, which the auctioneer looks up because BBS does not
+// send it, and it is empty when the LRP selects none.
 type LRPAuction struct {
 	bbsmodels.SchedulingLRP
 	AuctionRecord
+	ExecutionBackend string
 }
 
 func NewLRPAuction(lrp bbsmodels.SchedulingLRP, now time.Time) LRPAuction {
 	return LRPAuction{
-		lrp,
-		NewAuctionRecord(now),
+		SchedulingLRP: lrp,
+		AuctionRecord: NewAuctionRecord(now),
 	}
 }
 
 func (a *LRPAuction) Copy() LRPAuction {
-	return LRPAuction{a.SchedulingLRP.Copy(), a.AuctionRecord}
+	return LRPAuction{a.SchedulingLRP.Copy(), a.AuctionRecord, a.ExecutionBackend}
 }
 
+// TaskAuction is one task to place. ExecutionBackend has the same meaning as
+// it does for an LRPAuction.
 type TaskAuction struct {
 	bbsmodels.SchedulingTask
 	AuctionRecord
+	ExecutionBackend string
 }
 
 func NewTaskAuction(task bbsmodels.SchedulingTask, now time.Time) TaskAuction {
 	return TaskAuction{
-		task,
-		NewAuctionRecord(now),
+		SchedulingTask: task,
+		AuctionRecord:  NewAuctionRecord(now),
 	}
 }
 
 func (a *TaskAuction) Copy() TaskAuction {
-	return TaskAuction{a.SchedulingTask.Copy(), a.AuctionRecord}
+	return TaskAuction{a.SchedulingTask.Copy(), a.AuctionRecord, a.ExecutionBackend}
 }

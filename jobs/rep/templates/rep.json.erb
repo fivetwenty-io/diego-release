@@ -117,6 +117,32 @@
     declarative_healthcheck_default_timeout: p("diego.executor.declarative_healthcheck_default_timeout"),
   }
 
+  offered_execution_backends = p("diego.rep.execution_backends")
+  required_execution_backends = p("diego.rep.required_execution_backends")
+  offered_execution_backends.each do |backend|
+    unless %w[oci-runc oci-gvisor vm-qemu vm-firecracker].include?(backend)
+      raise "diego.rep.execution_backends has unknown execution backend '#{backend}', allowed entries are oci-gvisor, vm-qemu, and vm-firecracker"
+    end
+  end
+  required_execution_backends.each do |backend|
+    unless backend == "oci-runc" || offered_execution_backends.include?(backend)
+      raise "diego.rep.required_execution_backends has '#{backend}', which is not in diego.rep.execution_backends"
+    end
+  end
+  p("diego.rep.required_execution_backends_exempt_task_domains").each do |domain|
+    if domain.to_s.empty?
+      raise "diego.rep.required_execution_backends_exempt_task_domains has an empty task domain"
+    end
+  end
+  (p("diego.rep.placement_tags") + p("diego.rep.optional_placement_tags")).each do |tag|
+    if tag.start_with?("execution-backend.")
+      raise "placement tag '#{tag}' uses the prefix 'execution-backend.', which is reserved for the execution backend policy"
+    end
+  end
+  config[:execution_backends] = offered_execution_backends
+  config[:required_execution_backends] = required_execution_backends
+  config[:required_execution_backends_exempt_task_domains] = p("diego.rep.required_execution_backends_exempt_task_domains")
+
   if p("containers.graceful_shutdown_interval_in_seconds") < 10
     raise "graceful_shutdown_interval_in_seconds cannot be less than 10"
   end

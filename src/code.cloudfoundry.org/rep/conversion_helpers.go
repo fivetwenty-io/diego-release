@@ -181,6 +181,12 @@ func ConvertPreloadedRootFS(rootFS string, imageLayers []*models.ImageLayer, lay
 
 type RunRequestConversionHelper struct {
 	ECRHelper ecrhelper.ECRHelper
+
+	// ExecutionBackendPolicy, when set, refuses a workload whose execution
+	// backend the cell does not offer or does not accept. Placement applies the
+	// same policy, so a refusal here means the workload reached the cell
+	// without it, for example through an auctioneer that predates the policy.
+	ExecutionBackendPolicy *ExecutionBackendPolicy
 }
 
 func (rrch RunRequestConversionHelper) NewRunRequestFromDesiredLRP(
@@ -227,6 +233,11 @@ func (rrch RunRequestConversionHelper) NewRunRequestFromDesiredLRP(
 	executionBackend, err := executionBackendFromLRP(desiredLRP)
 	if err != nil {
 		return executor.RunRequest{}, err
+	}
+	if rrch.ExecutionBackendPolicy != nil {
+		if err := rrch.ExecutionBackendPolicy.Check(executionBackend, ""); err != nil {
+			return executor.RunRequest{}, err
+		}
 	}
 
 	// A VM backend boots one VM per launcher process, so the sidecars travel
@@ -334,6 +345,11 @@ func (rrch RunRequestConversionHelper) NewRunRequestFromTask(task *models.Task, 
 	}
 
 	executionBackend := executionBackendFromEnv(task.EnvironmentVariables)
+	if rrch.ExecutionBackendPolicy != nil {
+		if err := rrch.ExecutionBackendPolicy.Check(executionBackend, task.Domain); err != nil {
+			return executor.RunRequest{}, err
+		}
+	}
 	if err := checkVMBackendRootFS(executionBackend, task.RootFs); err != nil {
 		return executor.RunRequest{}, err
 	}

@@ -39,7 +39,7 @@ var _ = Describe("TaskProcessor", func() {
 		expectedCellID = "the-cell"
 		taskGuid = "the-guid"
 
-		processor = internal.NewTaskProcessor(bbsClient, containerDelegate, expectedCellID, rep.StackPathMap{}, "")
+		processor = internal.NewTaskProcessor(bbsClient, containerDelegate, expectedCellID, rep.StackPathMap{}, "", nil)
 
 		task = model_helpers.NewValidTask(taskGuid)
 		runRequestConversionHelper := rep.RunRequestConversionHelper{ECRHelper: &fakeecrhelper.FakeECRHelper{}}
@@ -165,6 +165,69 @@ var _ = Describe("TaskProcessor", func() {
 			It("runs the container and does not complete the task", func() {
 				Expect(containerDelegate.RunContainerCallCount()).To(Equal(1))
 				Expect(bbsClient.CompleteTaskCallCount()).To(Equal(0))
+			})
+		})
+
+		Context("when the cell requires an execution backend", func() {
+			var policy rep.ExecutionBackendPolicy
+
+			BeforeEach(func() {
+				var err error
+				policy, err = rep.NewExecutionBackendPolicy([]string{"oci-gvisor"}, []string{"oci-gvisor"}, []string{"cf-app-staging"})
+				Expect(err).NotTo(HaveOccurred())
+				processor = internal.NewTaskProcessor(bbsClient, containerDelegate, expectedCellID, rep.StackPathMap{}, "", &policy)
+				containerDelegate.RunContainerReturns(true)
+			})
+
+			Context("and a task outside the exempt domains selects no backend", func() {
+				BeforeEach(func() {
+					task.Domain = "cf-tasks"
+				})
+
+				It("does not run the container", func() {
+					Expect(containerDelegate.RunContainerCallCount()).To(Equal(0))
+				})
+
+				It("completes the task with failure and names what the cell requires", func() {
+					Expect(bbsClient.CompleteTaskCallCount()).To(Equal(1))
+					_, _, guid, cellId, failed, reason, _ := bbsClient.CompleteTaskArgsForCall(0)
+					Expect(guid).To(Equal(taskGuid))
+					Expect(cellId).To(Equal(expectedCellID))
+					Expect(failed).To(BeTrue())
+					Expect(reason).To(ContainSubstring(rep.ErrExecutionBackendNotAccepted.Error()))
+					Expect(reason).To(ContainSubstring(`this cell requires "oci-gvisor"`))
+				})
+
+				It("deletes the reserved container", func() {
+					Expect(containerDelegate.DeleteContainerCallCount()).To(Equal(1))
+				})
+			})
+
+			Context("and a task in an exempt domain selects no backend", func() {
+				BeforeEach(func() {
+					task.Domain = "cf-app-staging"
+				})
+
+				It("runs the container and does not complete the task", func() {
+					Expect(containerDelegate.RunContainerCallCount()).To(Equal(1))
+					Expect(bbsClient.CompleteTaskCallCount()).To(Equal(0))
+				})
+			})
+
+			Context("and a task selects a backend that the cell does not offer", func() {
+				BeforeEach(func() {
+					task.Domain = "cf-app-staging"
+					task.EnvironmentVariables = append(task.EnvironmentVariables,
+						&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "vm-qemu"})
+				})
+
+				It("completes the task with failure even in an exempt domain", func() {
+					Expect(containerDelegate.RunContainerCallCount()).To(Equal(0))
+					Expect(bbsClient.CompleteTaskCallCount()).To(Equal(1))
+					_, _, _, _, failed, reason, _ := bbsClient.CompleteTaskArgsForCall(0)
+					Expect(failed).To(BeTrue())
+					Expect(reason).To(ContainSubstring(rep.ErrExecutionBackendNotOffered.Error()))
+				})
 			})
 		})
 

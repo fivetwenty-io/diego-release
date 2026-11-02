@@ -1,6 +1,8 @@
 package auctionrunnerdelegate
 
 import (
+	"sync"
+
 	"code.cloudfoundry.org/bbs"
 	"code.cloudfoundry.org/bbs/models"
 
@@ -11,6 +13,9 @@ import (
 type AuctionRunnerDelegate struct {
 	repClientFactory models.RepClientFactory
 	bbsClient        bbs.InternalClient
+
+	lrpBackendsLock sync.Mutex
+	lrpBackends     map[string]string
 }
 
 func New(
@@ -20,6 +25,7 @@ func New(
 	return &AuctionRunnerDelegate{
 		repClientFactory: repClientFactory,
 		bbsClient:        bbsClient,
+		lrpBackends:      map[string]string{},
 	}
 }
 

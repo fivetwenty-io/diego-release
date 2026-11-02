@@ -104,6 +104,19 @@ func (a *auctionRunner) Run(signals <-chan os.Signal, ready chan<- struct{}) err
 				break
 			}
 
+			var unresolvedLRPs []auctiontypes.LRPAuction
+			var unresolvedTasks []auctiontypes.TaskAuction
+			if zonesAdvertiseExecutionBackends(zones) {
+				logger.Info("resolving-execution-backends")
+				a.delegate.ResolveExecutionBackends(logger, work.TraceID, lrpAuctions, taskAuctions)
+				lrpAuctions, unresolvedLRPs = partitionUnresolvedLRPs(lrpAuctions)
+				taskAuctions, unresolvedTasks = partitionUnresolvedTasks(taskAuctions)
+				logger.Info("resolved-execution-backends", lager.Data{
+					"unresolved-lrp-start-auctions": len(unresolvedLRPs),
+					"unresolved-task-auctions":      len(unresolvedTasks),
+				})
+			}
+
 			logger.Info("scheduling")
 			auctionRequest := auctiontypes.AuctionRequest{
 				LRPs:  lrpAuctions,
@@ -112,6 +125,8 @@ func (a *auctionRunner) Run(signals <-chan os.Signal, ready chan<- struct{}) err
 
 			scheduler := NewScheduler(a.workPool, zones, a.clock, logger, a.binPackFirstFitWeight, a.startingContainerWeight, a.startingContainerCountMaximum)
 			auctionResults := scheduler.Schedule(auctionRequest)
+			auctionResults.FailedLRPs = append(auctionResults.FailedLRPs, unresolvedLRPs...)
+			auctionResults.FailedTasks = append(auctionResults.FailedTasks, unresolvedTasks...)
 			logger.Info("scheduled", lager.Data{
 				"successful-lrp-start-auctions": len(auctionResults.SuccessfulLRPs),
 				"successful-task-auctions":      len(auctionResults.SuccessfulTasks),
@@ -128,6 +143,49 @@ func (a *auctionRunner) Run(signals <-chan os.Signal, ready chan<- struct{}) err
 			return nil
 		}
 	}
+}
+
+// zonesAdvertiseExecutionBackends reports whether any cell offers a backend
+// beyond oci-runc or requires one. When none does, every workload either runs
+// on oci-runc or fails on every cell alike, so the auction skips looking up
+// which backend each workload selects.
+func zonesAdvertiseExecutionBackends(zones map[string]Zone) bool {
+	for _, zone := range zones {
+		for _, cell := range zone {
+			if cell.AdvertisesExecutionBackends() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func partitionUnresolvedLRPs(auctions []auctiontypes.LRPAuction) ([]auctiontypes.LRPAuction, []auctiontypes.LRPAuction) {
+	resolved := make([]auctiontypes.LRPAuction, 0, len(auctions))
+	var unresolved []auctiontypes.LRPAuction
+	for _, auction := range auctions {
+		if auction.PlacementError != "" {
+			auction.Attempts++
+			unresolved = append(unresolved, auction)
+			continue
+		}
+		resolved = append(resolved, auction)
+	}
+	return resolved, unresolved
+}
+
+func partitionUnresolvedTasks(auctions []auctiontypes.TaskAuction) ([]auctiontypes.TaskAuction, []auctiontypes.TaskAuction) {
+	resolved := make([]auctiontypes.TaskAuction, 0, len(auctions))
+	var unresolved []auctiontypes.TaskAuction
+	for _, auction := range auctions {
+		if auction.PlacementError != "" {
+			auction.Attempts++
+			unresolved = append(unresolved, auction)
+			continue
+		}
+		resolved = append(resolved, auction)
+	}
+	return resolved, unresolved
 }
 
 func (a *auctionRunner) ScheduleLRPsForAuctions(lrpStarts []models.LRPStartRequest, traceID string) {

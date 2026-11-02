@@ -89,6 +89,8 @@ type RepConfig struct {
 	CommunicationTimeout            durationjson.Duration `json:"communication_timeout,omitempty"`
 	EvacuationPollingInterval       durationjson.Duration `json:"evacuation_polling_interval,omitempty"`
 	EvacuationTimeout               durationjson.Duration `json:"evacuation_timeout,omitempty"`
+	ExecutionBackends               []string              `json:"execution_backends,omitempty"`
+	ExecutionBackendExemptDomains   []string              `json:"required_execution_backends_exempt_task_domains,omitempty"`
 	ExtraRootfsDir                  string                `json:"extra_root_fs_dir"`
 	LayeringMode                    string                `json:"layering_mode,omitempty"`
 	ListenAddr                      string                `json:"listen_addr,omitempty"`
@@ -100,6 +102,7 @@ type RepConfig struct {
 	PollingInterval                 durationjson.Duration `json:"polling_interval,omitempty"`
 	PreloadedRootFS                 RootFSes              `json:"preloaded_root_fs"`
 	RepURL                          string                `json:"rep_url,omitempty"`
+	RequiredExecutionBackends       []string              `json:"required_execution_backends,omitempty"`
 	SidecarRootFSPath               string                `json:"sidecar_root_fs_path"`
 	SidecarRootFS                   string                `json:"sidecar_root_fs"`
 	ServerCertFile                  string                `json:"server_cert_file"` // DEPRECATED. Kept around for dusts compatability
