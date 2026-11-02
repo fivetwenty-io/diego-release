@@ -47,9 +47,10 @@ var (
 	ErrVMBackendSidecars = errors.New("VM execution backends do not support sidecars")
 
 	// ErrVMBackendRootFS is returned when an LRP or Task that selects a VM
-	// execution backend does not use a preloaded rootfs, which is the only kind
-	// of image that an operator installs on the cell.
-	ErrVMBackendRootFS = errors.New("VM execution backends require a preloaded rootfs")
+	// execution backend uses neither a preloaded rootfs, which is the only kind
+	// of image that an operator installs on the cell, nor a Docker image, which
+	// Garden boots inside the guest.
+	ErrVMBackendRootFS = errors.New("VM execution backends require a preloaded rootfs or a Docker image")
 )
 
 func ActualLRPKeyFromTags(tags executor.Tags) (*models.ActualLRPKey, error) {
@@ -425,11 +426,14 @@ func executionBackendFromLRP(desiredLRP *models.DesiredLRP) (string, error) {
 }
 
 // checkVMBackendRootFS returns ErrVMBackendRootFS when the backend is a VM
-// backend and the rootfs is not one of the operator's preloaded stacks, either
-// bare or with an application layer whose layer_path, once cleaned, is
-// /home/vcap or below it. Docker images and every other scheme are
-// refused, because a VM backend runs its hypervisor inside the image's mount
-// namespace and only trusts an image that an operator installed. The rootfs is
+// backend and the rootfs is neither a Docker image nor one of the operator's
+// preloaded stacks, either bare or with an application layer whose layer_path,
+// once cleaned, is /home/vcap or below it. Every other scheme is refused,
+// because a VM backend runs its hypervisor inside the image's mount namespace
+// and only trusts an image that an operator installed. A Docker image is
+// accepted because Guardian never runs the hypervisor in it. Guardian boots the
+// image inside the guest and runs the hypervisor on the operator's rootfs, and
+// it refuses the image itself when the cell has no such rootfs. The rootfs is
 // the one after ConvertPreloadedRootFS, so a preloaded stack with a droplet
 // layer already has the preloaded+layer scheme. Guardian enforces the same rule
 // for the image it receives; this check surfaces it before the container exists.
@@ -441,7 +445,7 @@ func checkVMBackendRootFS(backend, rootFS string) error {
 	scheme := ""
 	if u, err := url.Parse(rootFS); err == nil {
 		scheme = u.Scheme
-		if scheme == models.PreloadedRootFSScheme {
+		if scheme == models.PreloadedRootFSScheme || scheme == dockerRootFSScheme {
 			return nil
 		}
 		if scheme == models.PreloadedOCIRootFSScheme {
@@ -453,6 +457,10 @@ func checkVMBackendRootFS(backend, rootFS string) error {
 	}
 	return fmt.Errorf("%w: backend %q, rootfs scheme %q", ErrVMBackendRootFS, backend, scheme)
 }
+
+// dockerRootFSScheme is the scheme Cloud Controller gives the rootfs of a
+// Docker image app.
+const dockerRootFSScheme = "docker"
 
 const vcapHome = "/home/vcap"
 
