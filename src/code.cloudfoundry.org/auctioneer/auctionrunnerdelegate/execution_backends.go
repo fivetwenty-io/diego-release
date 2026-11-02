@@ -58,11 +58,18 @@ type rememberedBackend struct {
 // whose lookup fails or misses the deadline gets a placement error, and BBS
 // offers it again later through convergence.
 //
+// When no cell presence in the latest fetch advertises a policy, every cell
+// offers only oci-runc and requires nothing, so the delegate skips the lookup
+// and a foundation that never sets a policy pays nothing for it.
+//
 // The lookups that are in flight count against the concurrency limits until
 // BBS answers them, even after their round has given up on them, so a slow
 // BBS never sees more than the limits from the auctioneer.
 func (a *AuctionRunnerDelegate) ResolveExecutionBackends(logger lager.Logger, traceID string, lrps []auctiontypes.LRPAuction, tasks []auctiontypes.TaskAuction) {
 	if len(lrps) == 0 && len(tasks) == 0 {
+		return
+	}
+	if !a.cellsAdvertiseExecutionBackends.Load() {
 		return
 	}
 	logger = logger.Session("resolve-execution-backends")

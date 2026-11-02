@@ -2,6 +2,7 @@ package auctionrunnerdelegate
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"code.cloudfoundry.org/bbs"
@@ -10,6 +11,7 @@ import (
 
 	"code.cloudfoundry.org/auction/auctiontypes"
 	"code.cloudfoundry.org/lager/v3"
+	"code.cloudfoundry.org/rep"
 )
 
 type AuctionRunnerDelegate struct {
@@ -18,6 +20,10 @@ type AuctionRunnerDelegate struct {
 	clock            clock.Clock
 
 	executionBackendLookupTimeout time.Duration
+
+	// cellsAdvertiseExecutionBackends records whether any cell presence in the
+	// latest fetch advertised an execution backend policy.
+	cellsAdvertiseExecutionBackends atomic.Bool
 
 	lrpBackendsLock sync.Mutex
 	lrpBackends     map[string]rememberedBackend
@@ -55,6 +61,21 @@ func (a *AuctionRunnerDelegate) FetchCellReps(logger lager.Logger, traceID strin
 	if err != nil {
 		return cellReps, err
 	}
+
+	// The presences include cells that are evacuating and cells whose state
+	// the auction cannot fetch, which the zones leave out, so a VM workload is
+	// still resolved, and not placed on a cell that refuses it, when those are
+	// the only cells that offer its backend.
+	advertise := false
+	for _, cell := range cells {
+		for _, tag := range cell.OptionalPlacementTags {
+			if rep.IsExecutionBackendPlacementTag(tag) {
+				advertise = true
+				break
+			}
+		}
+	}
+	a.cellsAdvertiseExecutionBackends.Store(advertise)
 
 	for _, cell := range cells {
 		client, err := a.repClientFactory.CreateClient(cell.RepAddress, cell.RepUrl, traceID)

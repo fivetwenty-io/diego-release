@@ -33,6 +33,8 @@ var _ = Describe("Resolving execution backends", func() {
 		desiredLRPs map[string]*models.DesiredLRP
 	)
 
+	var fetchCells func(cells ...*models.CellPresence)
+
 	const lookupTimeout = 3 * time.Second
 
 	desiredLRPWithBackend := func(processGuid, backend string) *models.DesiredLRP {
@@ -61,11 +63,26 @@ var _ = Describe("Resolving execution backends", func() {
 		)
 	}
 
+	cellPresence := func(cellID string, optionalPlacementTags ...string) *models.CellPresence {
+		presence := models.NewCellPresence(cellID, cellID+".url", "", "z1", models.NewCellCapacity(100, 100, 100), []string{}, []string{}, []string{}, []string{}, optionalPlacementTags, map[string]string{})
+		return &presence
+	}
+
+	fetchCells = func(cells ...*models.CellPresence) {
+		bbsClient.CellsReturns(cells, nil)
+		_, err := delegate.FetchCellReps(logger, "trace-id")
+		Expect(err).NotTo(HaveOccurred())
+	}
+
 	BeforeEach(func() {
 		bbsClient = &fake_bbs.FakeInternalClient{}
 		logger = lagertest.NewTestLogger("delegate")
 		fakeClock = fakeclock.NewFakeClock(time.Now())
 		delegate = auctionrunnerdelegate.New(&repfakes.FakeClientFactory{}, bbsClient, fakeClock, lookupTimeout)
+
+		// The round fetches the cells before it resolves backends, and one of
+		// them advertises a policy.
+		fetchCells(cellPresence("vm-cell", "execution-backend.offered:vm-qemu"), cellPresence("old-cell"))
 
 		desiredLRPs = map[string]*models.DesiredLRP{}
 		bbsClient.DesiredLRPsStub = func(_ lager.Logger, _ string, filter models.DesiredLRPFilter) ([]*models.DesiredLRP, error) {
@@ -312,6 +329,45 @@ var _ = Describe("Resolving execution backends", func() {
 			Expect(tasks[0].PlacementError).To(BeEmpty())
 			Expect(tasks[0].ExecutionBackend).To(Equal(""))
 			Expect(tasks[0].AppExecutionBackend).To(Equal("vm-firecracker"))
+		})
+	})
+
+	Describe("deciding whether to look up backends", func() {
+		It("skips the lookup when no cell presence advertises a policy", func() {
+			fetchCells(cellPresence("old-cell", "some-optional-tag"), cellPresence("other-old-cell"))
+
+			lrps := []auctiontypes.LRPAuction{lrpAuction("pg-vm", 0)}
+			tasks := []auctiontypes.TaskAuction{taskAuction("tg-1")}
+			delegate.ResolveExecutionBackends(logger, "trace-id", lrps, tasks)
+
+			Expect(bbsClient.DesiredLRPsCallCount()).To(Equal(0))
+			Expect(bbsClient.TaskByGuidCallCount()).To(Equal(0))
+			Expect(lrps[0].ExecutionBackend).To(BeEmpty())
+			Expect(lrps[0].PlacementError).To(BeEmpty())
+			Expect(tasks[0].PlacementError).To(BeEmpty())
+		})
+
+		It("looks up the backends when the only cell that advertises a policy is in the presences but not in the zones", func() {
+			// An evacuating cell, or one whose state the auction cannot
+			// fetch, keeps its presence, so a VM workload still gets its
+			// backend and is not placed on a cell that refuses it.
+			fetchCells(cellPresence("old-cell"), cellPresence("evacuating-vm-cell", "execution-backend.offered:vm-qemu", "execution-backend.required:vm-qemu"))
+			desiredLRPs["pg-vm"] = desiredLRPWithBackend("pg-vm", "vm-qemu")
+
+			lrps := []auctiontypes.LRPAuction{lrpAuction("pg-vm", 0)}
+			delegate.ResolveExecutionBackends(logger, "trace-id", lrps, nil)
+
+			Expect(bbsClient.DesiredLRPsCallCount()).To(Equal(1))
+			Expect(lrps[0].ExecutionBackend).To(Equal("vm-qemu"))
+		})
+
+		It("follows the latest fetch when the last cell that advertised a policy goes away", func() {
+			fetchCells(cellPresence("old-cell"))
+
+			lrps := []auctiontypes.LRPAuction{lrpAuction("pg-vm", 0)}
+			delegate.ResolveExecutionBackends(logger, "trace-id", lrps, nil)
+
+			Expect(bbsClient.DesiredLRPsCallCount()).To(Equal(0))
 		})
 	})
 

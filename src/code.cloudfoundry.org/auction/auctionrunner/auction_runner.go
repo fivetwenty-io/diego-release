@@ -104,11 +104,12 @@ func (a *auctionRunner) Run(signals <-chan os.Signal, ready chan<- struct{}) err
 				break
 			}
 
-			// Every round resolves backends, even when no cell in the zones
-			// advertises one. The zones leave out evacuating cells and cells
-			// whose state could not be fetched, so a round can miss the only
-			// cells that offer a VM backend, and a VM workload placed without
-			// its backend would land on a cell that refuses it.
+			// Every round asks the delegate to resolve backends, even when no
+			// cell in the zones advertises one. The zones leave out evacuating
+			// cells and cells whose state could not be fetched, so a round can
+			// miss the only cells that offer a VM backend, and a VM workload
+			// placed without its backend would land on a cell that refuses it.
+			// The delegate decides from the cell presences instead.
 			logger.Info("resolving-execution-backends")
 			a.delegate.ResolveExecutionBackends(logger, work.TraceID, lrpAuctions, taskAuctions)
 			lrpAuctions, unresolvedLRPs := partitionUnresolvedLRPs(lrpAuctions)

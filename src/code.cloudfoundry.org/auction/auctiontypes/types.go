@@ -76,6 +76,8 @@ type AuctionRunnerDelegate interface {
 	// the backend that its workload selects, and the AppExecutionBackend of
 	// every task auction. When it cannot tell in time, it sets the auction's
 	// PlacementError instead, and the auction is not scheduled in this round.
+	// It may leave every auction unchanged when no cell that FetchCellReps
+	// returned advertises an execution backend policy.
 	ResolveExecutionBackends(logger lager.Logger, traceID string, lrps []LRPAuction, tasks []TaskAuction)
 }
 
