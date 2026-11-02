@@ -104,6 +104,30 @@ func (a *auctionRunner) Run(signals <-chan os.Signal, ready chan<- struct{}) err
 				break
 			}
 
+			// Every round asks the delegate to resolve backends, even when no
+			// cell in the zones advertises one. The zones leave out evacuating
+			// cells and cells whose state could not be fetched, so a round can
+			// miss the only cells that offer a VM backend, and a VM workload
+			// placed without its backend would land on a cell that refuses it.
+			// The delegate decides from the cell presences instead.
+			logger.Info("resolving-execution-backends")
+			a.delegate.ResolveExecutionBackends(logger, work.TraceID, lrpAuctions, taskAuctions)
+			lrpAuctions, unresolvedLRPs := partitionUnresolvedLRPs(lrpAuctions)
+			taskAuctions, unresolvedTasks := partitionUnresolvedTasks(taskAuctions)
+			logger.Info("resolved-execution-backends", lager.Data{
+				"unresolved-lrp-start-auctions": len(unresolvedLRPs),
+				"unresolved-task-auctions":      len(unresolvedTasks),
+			})
+			for i := range unresolvedTasks {
+				// Rejecting the task would use one of the retries that BBS
+				// allows it, so the round leaves it pending, and BBS
+				// convergence offers it to the auctioneer again.
+				logger.Info("deferring-unresolved-task", lager.Data{
+					"task-guid": unresolvedTasks[i].TaskGuid,
+					"reason":    unresolvedTasks[i].PlacementError,
+				})
+			}
+
 			logger.Info("scheduling")
 			auctionRequest := auctiontypes.AuctionRequest{
 				LRPs:  lrpAuctions,
@@ -112,6 +136,7 @@ func (a *auctionRunner) Run(signals <-chan os.Signal, ready chan<- struct{}) err
 
 			scheduler := NewScheduler(a.workPool, zones, a.clock, logger, a.binPackFirstFitWeight, a.startingContainerWeight, a.startingContainerCountMaximum)
 			auctionResults := scheduler.Schedule(auctionRequest)
+			auctionResults.FailedLRPs = append(auctionResults.FailedLRPs, unresolvedLRPs...)
 			logger.Info("scheduled", lager.Data{
 				"successful-lrp-start-auctions": len(auctionResults.SuccessfulLRPs),
 				"successful-task-auctions":      len(auctionResults.SuccessfulTasks),
@@ -128,6 +153,33 @@ func (a *auctionRunner) Run(signals <-chan os.Signal, ready chan<- struct{}) err
 			return nil
 		}
 	}
+}
+
+func partitionUnresolvedLRPs(auctions []auctiontypes.LRPAuction) ([]auctiontypes.LRPAuction, []auctiontypes.LRPAuction) {
+	resolved := make([]auctiontypes.LRPAuction, 0, len(auctions))
+	var unresolved []auctiontypes.LRPAuction
+	for _, auction := range auctions {
+		if auction.PlacementError != "" {
+			auction.Attempts++
+			unresolved = append(unresolved, auction)
+			continue
+		}
+		resolved = append(resolved, auction)
+	}
+	return resolved, unresolved
+}
+
+func partitionUnresolvedTasks(auctions []auctiontypes.TaskAuction) ([]auctiontypes.TaskAuction, []auctiontypes.TaskAuction) {
+	resolved := make([]auctiontypes.TaskAuction, 0, len(auctions))
+	var unresolved []auctiontypes.TaskAuction
+	for _, auction := range auctions {
+		if auction.PlacementError != "" {
+			unresolved = append(unresolved, auction)
+			continue
+		}
+		resolved = append(resolved, auction)
+	}
+	return resolved, unresolved
 }
 
 func (a *auctionRunner) ScheduleLRPsForAuctions(lrpStarts []models.LRPStartRequest, traceID string) {

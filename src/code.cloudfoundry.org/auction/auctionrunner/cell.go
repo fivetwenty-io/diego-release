@@ -3,6 +3,7 @@ package auctionrunner
 import (
 	"code.cloudfoundry.org/bbs/models"
 	"code.cloudfoundry.org/lager/v3"
+	"code.cloudfoundry.org/rep"
 )
 
 const LocalityOffset = 1000
@@ -14,17 +15,20 @@ type Cell struct {
 	state  models.CellState
 	Index  int
 
+	executionBackendPolicy rep.ExecutionBackendPolicy
+
 	workToCommit models.Work
 }
 
 func NewCell(logger lager.Logger, guid string, client models.RepClient, state models.CellState) *Cell {
 	return &Cell{
-		logger:       logger,
-		Guid:         guid,
-		client:       client,
-		state:        state,
-		Index:        state.CellIndex,
-		workToCommit: models.Work{CellID: guid},
+		logger:                 logger,
+		Guid:                   guid,
+		client:                 client,
+		state:                  state,
+		Index:                  state.CellIndex,
+		executionBackendPolicy: rep.ExecutionBackendPolicyFromPlacementTags(state.OptionalPlacementTags),
+		workToCommit:           models.Work{CellID: guid},
 	}
 }
 
@@ -42,6 +46,19 @@ func (c *Cell) MatchVolumeDrivers(volumeDrivers []string) bool {
 
 func (c *Cell) MatchPlacementTags(placementTags []string) bool {
 	return c.state.MatchPlacementTags(placementTags)
+}
+
+// MatchExecutionBackend returns nil when the cell offers and accepts the
+// backend, and otherwise the refusal from the cell's policy. taskDomain and
+// appBackend are empty for an LRP.
+func (c *Cell) MatchExecutionBackend(backend, taskDomain, appBackend string) error {
+	return c.executionBackendPolicy.Check(backend, taskDomain, appBackend)
+}
+
+// RequiredExecutionBackends returns the backends that the cell requires, or
+// nil when it requires none.
+func (c *Cell) RequiredExecutionBackends() []string {
+	return c.executionBackendPolicy.Required()
 }
 
 func (c *Cell) State() models.CellState {

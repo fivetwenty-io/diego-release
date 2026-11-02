@@ -48,6 +48,11 @@ func (a *auctionRunnerDelegate) AuctionCompleted(logger lager.Logger, traceID st
 	a.workResults.SuccessfulTasks = append(a.workResults.SuccessfulTasks, work.SuccessfulTasks...)
 }
 
+// ResolveExecutionBackends leaves every auction without a backend, because the
+// simulated cells offer only oci-runc.
+func (a *auctionRunnerDelegate) ResolveExecutionBackends(lager.Logger, string, []auctiontypes.LRPAuction, []auctiontypes.TaskAuction) {
+}
+
 func (a *auctionRunnerDelegate) ResultSize() int {
 	a.lock.Lock()
 	defer a.lock.Unlock()

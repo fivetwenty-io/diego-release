@@ -257,6 +257,29 @@ var _ = Describe("The Rep", func() {
 			})
 		})
 
+		Context("when the cell requires an execution backend that it does not offer", func() {
+			BeforeEach(func() {
+				repConfig.ExecutionBackends = []string{"vm-qemu"}
+				repConfig.RequiredExecutionBackends = []string{"vm-firecracker"}
+			})
+
+			It("logs the invalid policy and exits non zero", func() {
+				Eventually(runner.Session).Should(Exit(2))
+				Expect(runner.Session).To(gbytes.Say("invalid-execution-backend-policy"))
+			})
+		})
+
+		Context("when a placement tag uses the reserved execution backend prefix", func() {
+			BeforeEach(func() {
+				repConfig.OptionalPlacementTags = []string{"execution-backend.offered:vm-qemu"}
+			})
+
+			It("logs the reserved tag and exits non zero", func() {
+				Eventually(runner.Session).Should(Exit(2))
+				Expect(runner.Session).To(gbytes.Say("reserved-placement-tag"))
+			})
+		})
+
 		Context("when locket registration is enabled and locket address is not provided", func() {
 			BeforeEach(func() {
 				repConfig.LocketAddress = ""
@@ -847,6 +870,35 @@ dYbCU/DMZjsv+Pt9flhj7ELLo+WKHyI767hJSq9A7IT3GzFt8iGiEAt1qj2yS0DX
 				Expect(value.CellId).To(Equal(repConfig.CellID))
 			})
 
+			Context("when the cell offers execution backends", func() {
+				BeforeEach(func() {
+					repConfig.ExecutionBackends = []string{"vm-qemu", "oci-gvisor"}
+					repConfig.RequiredExecutionBackends = []string{"vm-qemu"}
+					repConfig.ExecutionBackendExemptDomains = []string{"cf-app-staging"}
+				})
+
+				It("advertises its policy after the operator's optional placement tags", func() {
+					locketClient, err := locket.NewClient(logger, repConfig.ClientLocketConfig)
+					Expect(err).NotTo(HaveOccurred())
+
+					Eventually(func() error {
+						response, err = locketClient.Fetch(context.Background(), &locketmodels.FetchRequest{Key: repConfig.CellID})
+						return err
+					}, 10*time.Second).Should(Succeed())
+					value := &models.CellPresence{}
+					err = json.Unmarshal([]byte(response.Resource.Value), value)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(value.PlacementTags).To(Equal([]string{"test"}))
+					Expect(value.OptionalPlacementTags).To(Equal([]string{
+						"optional_tag",
+						"execution-backend.offered:oci-gvisor",
+						"execution-backend.offered:vm-qemu",
+						"execution-backend.required:vm-qemu",
+						"execution-backend.exempt-task-domain:cf-app-staging",
+					}))
+				})
+			})
+
 			Context("when it loses its presence", func() {
 				var locketClient locketmodels.LocketClient
 
@@ -1042,6 +1094,19 @@ dYbCU/DMZjsv+Pt9flhj7ELLo+WKHyI767hJSq9A7IT3GzFt8iGiEAt1qj2yS0DX
 						Expect(lrp.MaxPids).To(BeEquivalentTo(10))
 						Expect(lrp.State).To(BeEquivalentTo("CLAIMED"))
 					})
+				})
+			})
+
+			Context("when the cell offers execution backends", func() {
+				BeforeEach(func() {
+					repConfig.ExecutionBackends = []string{"oci-gvisor"}
+				})
+
+				It("reports its policy in the cell state", func() {
+					state, err := repClient.State(logger)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(state.PlacementTags).To(Equal([]string{"test"}))
+					Expect(state.OptionalPlacementTags).To(Equal([]string{"optional_tag", "execution-backend.offered:oci-gvisor"}))
 				})
 			})
 
