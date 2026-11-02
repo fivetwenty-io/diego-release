@@ -1097,8 +1097,8 @@ var _ = Describe("Resources", func() {
 							Entry("vm-qemu with a droplet layer escaping /home/vcap", "vm-qemu", "preloaded+layer:cflinuxfs3?layer=http://file-server/layer.tgz&layer_digest=some-digest&layer_path=/home/vcap/../../etc", true),
 							Entry("vm-qemu with a droplet layer and no layer_path", "vm-qemu", "preloaded+layer:cflinuxfs3?layer=http://file-server/layer.tgz&layer_digest=some-digest", true),
 							Entry("vm-firecracker with a preloaded stack", "vm-firecracker", "preloaded:cflinuxfs3", false),
-							Entry("vm-qemu with a docker image", "vm-qemu", "docker:///cloudfoundry/test", true),
-							Entry("vm-firecracker with a docker image", "vm-firecracker", "docker://registry.example.com/cloudfoundry/test", true),
+							Entry("vm-qemu with a docker image", "vm-qemu", "docker:///cloudfoundry/test", false),
+							Entry("vm-firecracker with a docker image", "vm-firecracker", "docker://registry.example.com/cloudfoundry/test", false),
 							Entry("vm-qemu with an unknown scheme", "vm-qemu", "oci:///some/image", true),
 							Entry("vm-qemu with no rootfs", "vm-qemu", "", true),
 							Entry("oci-gvisor with a docker image", "oci-gvisor", "docker:///cloudfoundry/test", false),
@@ -1106,11 +1106,11 @@ var _ = Describe("Resources", func() {
 						)
 
 						It("names the scheme and never the rootfs URL", func() {
-							desiredLRP.RootFs = "docker://some-user:some-secret@registry.example.com/cloudfoundry/test"
+							desiredLRP.RootFs = "oci://some-user:some-secret@registry.example.com/cloudfoundry/test"
 							desiredLRP.Action = wrap(launcher(backendEnv("vm-qemu")...))
 
 							_, err := rootFSRequest()
-							Expect(err).To(MatchError(ContainSubstring(`rootfs scheme "docker"`)))
+							Expect(err).To(MatchError(ContainSubstring(`rootfs scheme "oci"`)))
 							Expect(err.Error()).NotTo(ContainSubstring("some-secret"))
 							Expect(err.Error()).NotTo(ContainSubstring("registry.example.com"))
 						})
@@ -1134,7 +1134,7 @@ var _ = Describe("Resources", func() {
 						})
 
 						It("reports the sidecar limitation first when both apply", func() {
-							desiredLRP.RootFs = "docker:///cloudfoundry/test"
+							desiredLRP.RootFs = "oci:///some/image"
 							desiredLRP.Action = wrap(launcher(backendEnv("vm-qemu")...))
 							desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(&models.RunAction{Path: "/tmp/other"})}}
 
@@ -1499,8 +1499,9 @@ var _ = Describe("Resources", func() {
 						},
 						Entry("vm-qemu with a preloaded stack", "vm-qemu", "preloaded:cflinuxfs3", false),
 						Entry("vm-firecracker with a preloaded stack and a layer", "vm-firecracker", "preloaded+layer:cflinuxfs3?layer=http://file-server/layer.tgz&layer_digest=some-digest&layer_path=/home/vcap", false),
-						Entry("vm-qemu with a docker image", "vm-qemu", "docker:///cloudfoundry/test", true),
-						Entry("vm-firecracker with a docker image", "vm-firecracker", "docker:///cloudfoundry/test", true),
+						Entry("vm-qemu with a docker image", "vm-qemu", "docker:///cloudfoundry/test", false),
+						Entry("vm-firecracker with a docker image", "vm-firecracker", "docker:///cloudfoundry/test", false),
+						Entry("vm-qemu with an unknown scheme", "vm-qemu", "oci:///some/image", true),
 						Entry("vm-qemu with no rootfs", "vm-qemu", "", true),
 						Entry("oci-gvisor with a docker image", "oci-gvisor", "docker:///cloudfoundry/test", false),
 						Entry("no backend with a docker image", "", "docker:///cloudfoundry/test", false),
