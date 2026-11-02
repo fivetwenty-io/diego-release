@@ -87,7 +87,10 @@ func (p *taskProcessor) processActiveContainer(logger lager.Logger, traceID stri
 	runReq, err := p.runRequestConversionHelper.NewRunRequestFromTask(task, p.stackPathMap, p.layeringMode)
 	if err != nil {
 		logger.Error("failed-to-construct-run-request", err)
-		if errors.Is(err, rep.ErrVMBackendRootFS) || rep.IsExecutionBackendPolicyError(err) {
+		switch {
+		case rep.IsExecutionBackendPolicyError(err):
+			p.rejectMisplacedTask(logger, traceID, container.Guid, err)
+		case errors.Is(err, rep.ErrVMBackendRootFS):
 			p.failUnrunnableTask(logger, traceID, container.Guid, err)
 		}
 		return
@@ -111,6 +114,21 @@ func (p *taskProcessor) failUnrunnableTask(logger lager.Logger, traceID, taskGui
 	err := p.bbsClient.CompleteTask(logger, traceID, taskGuid, p.cellID, true, reason.Error(), "")
 	if err != nil {
 		logger.Error("failed-completing-task", err)
+	}
+
+	p.containerDelegate.DeleteContainer(logger, traceID, taskGuid)
+}
+
+// rejectMisplacedTask hands a task back to BBS when this cell's execution
+// backend policy refuses it, which happens only when an auctioneer that does
+// not know the policy placed it here. BBS offers the task to the auctioneer
+// again, and it fails the task only once the task has used its rejections.
+// The reserved container is deleted even when rejecting the task fails.
+func (p *taskProcessor) rejectMisplacedTask(logger lager.Logger, traceID, taskGuid string, reason error) {
+	logger.Info("rejecting-task")
+	err := p.bbsClient.RejectTask(logger, traceID, taskGuid, reason.Error())
+	if err != nil {
+		logger.Error("failed-rejecting-task", err)
 	}
 
 	p.containerDelegate.DeleteContainer(logger, traceID, taskGuid)

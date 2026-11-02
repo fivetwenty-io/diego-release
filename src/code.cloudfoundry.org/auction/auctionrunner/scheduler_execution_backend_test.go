@@ -60,6 +60,12 @@ var _ = Describe("Scheduler with execution backends", func() {
 		return auction
 	}
 
+	stagingTaskAuction := func(taskGuid, appBackend string, placementTags []string) auctiontypes.TaskAuction {
+		auction := taskAuction(taskGuid, "cf-app-staging", "", placementTags)
+		auction.AppExecutionBackend = appBackend
+		return auction
+	}
+
 	BeforeEach(func() {
 		clock = fakeclock.NewFakeClock(time.Now())
 
@@ -136,7 +142,7 @@ var _ = Describe("Scheduler with execution backends", func() {
 			Expect(results.SuccessfulLRPs).To(BeEmpty())
 			Expect(results.FailedLRPs).To(HaveLen(1))
 			Expect(results.FailedLRPs[0].PlacementError).To(Equal(
-				`found no compatible cell accepting execution backend "oci-runc", the matching cells require "vm-firecracker" or "vm-qemu"`))
+				`found no compatible cell accepting execution backend "oci-runc", the cells that offer it require "vm-firecracker" or "vm-qemu"`))
 		})
 
 		It("fails an LRP in the segment that selects an offered backend the cells do not require", func() {
@@ -149,7 +155,7 @@ var _ = Describe("Scheduler with execution backends", func() {
 
 			Expect(results.FailedLRPs).To(HaveLen(1))
 			Expect(results.FailedLRPs[0].PlacementError).To(Equal(
-				`found no compatible cell accepting execution backend "oci-gvisor", the matching cells require "vm-qemu"`))
+				`found no compatible cell accepting execution backend "oci-gvisor", the cells that offer it require "vm-qemu"`))
 		})
 
 		It("keeps the rootfs mismatch when no cell matches the rootfs", func() {
@@ -191,18 +197,46 @@ var _ = Describe("Scheduler with execution backends", func() {
 
 			Expect(results.FailedLRPs).To(HaveLen(1))
 			Expect(results.FailedLRPs[0].PlacementError).To(Equal(
-				`found no compatible cell accepting execution backend "oci-runc", the matching cells require "vm-firecracker" or "vm-qemu"`))
+				`found no compatible cell accepting execution backend "oci-runc", the cells that offer it require "vm-firecracker" or "vm-qemu"`))
 		})
 	})
 
 	Describe("tasks", func() {
-		It("places a staging task in the segment that selects no backend on the VM cell", func() {
-			auction := taskAuction("tg-stage", "cf-app-staging", "", []string{"vm-seg"})
+		It("places a staging task in the segment on the VM cell when the app it builds selects a backend the cell requires", func() {
+			auction := stagingTaskAuction("tg-stage", "vm-firecracker", []string{"vm-seg"})
 			results = schedule(auctiontypes.AuctionRequest{Tasks: []auctiontypes.TaskAuction{auction}})
 
 			Expect(results.FailedTasks).To(BeEmpty())
 			Expect(results.SuccessfulTasks).To(HaveLen(1))
 			Expect(results.SuccessfulTasks[0].Winner).To(Equal("vm-cell"))
+		})
+
+		It("fails a staging task in the segment when the app it builds selects no backend", func() {
+			auction := stagingTaskAuction("tg-stage", "", []string{"vm-seg"})
+			results = schedule(auctiontypes.AuctionRequest{Tasks: []auctiontypes.TaskAuction{auction}})
+
+			Expect(results.SuccessfulTasks).To(BeEmpty())
+			Expect(results.FailedTasks).To(HaveLen(1))
+			Expect(results.FailedTasks[0].PlacementError).To(Equal(
+				`found no compatible cell accepting execution backend "oci-runc", the cells that offer it require "vm-firecracker" or "vm-qemu"`))
+			Expect(clients["vm-cell"].PerformCallCount()).To(Equal(0))
+		})
+
+		It("fails a staging task in the segment when the app it builds selects a backend the cell does not require", func() {
+			auction := stagingTaskAuction("tg-stage", "oci-gvisor", []string{"vm-seg"})
+			results = schedule(auctiontypes.AuctionRequest{Tasks: []auctiontypes.TaskAuction{auction}})
+
+			Expect(results.SuccessfulTasks).To(BeEmpty())
+			Expect(results.FailedTasks).To(HaveLen(1))
+		})
+
+		It("places a staging task outside the segment on a cell that accepts oci-runc, whatever the app selects", func() {
+			auction := stagingTaskAuction("tg-stage", "vm-qemu", []string{})
+			results = schedule(auctiontypes.AuctionRequest{Tasks: []auctiontypes.TaskAuction{auction}})
+
+			Expect(results.FailedTasks).To(BeEmpty())
+			Expect(results.SuccessfulTasks).To(HaveLen(1))
+			Expect(results.SuccessfulTasks[0].Winner).To(BeElementOf("shared-cell", "gvisor-cell"))
 		})
 
 		It("fails another task in the segment that selects no backend and names what the cells require", func() {
@@ -213,7 +247,7 @@ var _ = Describe("Scheduler with execution backends", func() {
 			Expect(results.FailedTasks).To(HaveLen(1))
 			Expect(results.FailedTasks[0].Attempts).To(Equal(auction.Attempts + 1))
 			Expect(results.FailedTasks[0].PlacementError).To(Equal(
-				`found no compatible cell accepting execution backend "oci-runc", the matching cells require "vm-firecracker" or "vm-qemu"`))
+				`found no compatible cell accepting execution backend "oci-runc", the cells that offer it require "vm-firecracker" or "vm-qemu"`))
 		})
 
 		It("places a task in the segment that selects a VM backend on the VM cell", func() {
@@ -240,6 +274,36 @@ var _ = Describe("Scheduler with execution backends", func() {
 
 			Expect(results.SuccessfulTasks).To(HaveLen(1))
 			Expect(results.SuccessfulTasks[0].Winner).To(Equal("gvisor-cell"))
+		})
+
+		It("places a task on the zone whose cell offers its backend when another zone's cell does not", func() {
+			addCell("z2", "qemu-cell", linuxOnlyRootFSProviders, []string{"vm-seg-2"},
+				policyTags([]string{"vm-qemu"}, []string{"vm-qemu"}, nil))
+			addCell("z1", "plain-seg-2-cell", linuxOnlyRootFSProviders, []string{"vm-seg-2"}, []string{})
+
+			auction := taskAuction("tg-vm", "cf-tasks", "vm-qemu", []string{"vm-seg-2"})
+			results = schedule(auctiontypes.AuctionRequest{Tasks: []auctiontypes.TaskAuction{auction}})
+
+			Expect(results.FailedTasks).To(BeEmpty())
+			Expect(results.SuccessfulTasks).To(HaveLen(1))
+			Expect(results.SuccessfulTasks[0].Winner).To(Equal("qemu-cell"))
+			Expect(clients["plain-seg-2-cell"].PerformCallCount()).To(Equal(0))
+		})
+
+		It("combines what the cells require across zones for a task", func() {
+			addCell("z2", "qemu-only-cell", linuxOnlyRootFSProviders, []string{"vm-seg-2"},
+				policyTags([]string{"vm-qemu"}, []string{"vm-qemu"}, nil))
+			addCell("z3", "windows-cell", windowsOnlyRootFSProviders, []string{}, []string{})
+			addCell("z1", "firecracker-only-cell", linuxOnlyRootFSProviders, []string{"vm-seg-2"},
+				policyTags([]string{"vm-firecracker"}, []string{"vm-firecracker"}, nil))
+
+			auction := taskAuction("tg-runc", "cf-tasks", "", []string{"vm-seg-2"})
+			results = schedule(auctiontypes.AuctionRequest{Tasks: []auctiontypes.TaskAuction{auction}})
+
+			Expect(results.SuccessfulTasks).To(BeEmpty())
+			Expect(results.FailedTasks).To(HaveLen(1))
+			Expect(results.FailedTasks[0].PlacementError).To(Equal(
+				`found no compatible cell accepting execution backend "oci-runc", the cells that offer it require "vm-firecracker" or "vm-qemu"`))
 		})
 	})
 })

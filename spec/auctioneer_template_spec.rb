@@ -63,6 +63,19 @@ describe 'auctioneer' do
       end
     end
 
+    context 'execution backend lookup timeout' do
+      let(:rendered_config) { JSON.parse(rendered_template) }
+
+      it 'defaults to five seconds' do
+        expect(rendered_config['execution_backend_lookup_timeout']).to eq('5s')
+      end
+
+      it 'renders an overridden value' do
+        deployment_manifest_fragment['diego']['auctioneer']['execution_backend_lookup_timeout'] = '2s'
+        expect(rendered_config['execution_backend_lookup_timeout']).to eq('2s')
+      end
+    end
+
     context 'BBS health check (CFAR-1457)' do
       let(:rendered_config) { JSON.parse(rendered_template) }
 

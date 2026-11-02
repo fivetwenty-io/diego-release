@@ -49,16 +49,10 @@ func (c *Cell) MatchPlacementTags(placementTags []string) bool {
 }
 
 // MatchExecutionBackend returns nil when the cell offers and accepts the
-// backend, and otherwise the refusal from the cell's policy. taskDomain is
-// empty for an LRP.
-func (c *Cell) MatchExecutionBackend(backend, taskDomain string) error {
-	return c.executionBackendPolicy.Check(backend, taskDomain)
-}
-
-// AdvertisesExecutionBackends reports whether the cell offers a backend beyond
-// oci-runc or requires one.
-func (c *Cell) AdvertisesExecutionBackends() bool {
-	return c.executionBackendPolicy.Advertised()
+// backend, and otherwise the refusal from the cell's policy. taskDomain and
+// appBackend are empty for an LRP.
+func (c *Cell) MatchExecutionBackend(backend, taskDomain, appBackend string) error {
+	return c.executionBackendPolicy.Check(backend, taskDomain, appBackend)
 }
 
 // RequiredExecutionBackends returns the backends that the cell requires, or

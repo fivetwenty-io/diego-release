@@ -85,7 +85,8 @@ properties:
   diego.rep.execution_backends:
     description: |
       Execution backends this cell offers in addition to the always-available
-      oci-runc. Allowed entries are oci-gvisor, vm-qemu, and vm-firecracker.
+      oci-runc. Allowed entries are oci-runc, oci-gvisor, vm-qemu, and
+      vm-firecracker, and listing oci-runc changes nothing.
       Set it to the same list as garden.execution_backends on this cell. The
       rep advertises the list in its cell presence, the auctioneer places a
       workload that selects a backend only on a cell that offers it, and the
@@ -103,11 +104,16 @@ properties:
     default: []
   diego.rep.required_execution_backends_exempt_task_domains:
     description: |
-      Task domains that diego.rep.required_execution_backends does not apply
-      to. A task in one of these domains may select any offered backend, or
-      none. Cloud Controller stages apps in the cf-app-staging domain without
-      selecting a backend, so leaving it here lets apps in a segment that
-      requires a VM backend still stage there.
+      Task domains whose tasks may run on any offered backend, or none, on a
+      cell with diego.rep.required_execution_backends, as long as the app the
+      task builds selects one of the required backends in the
+      CF_EXECUTION_BACKEND of the task's run action. Cloud Controller stages
+      an app in the cf-app-staging domain in a task that selects no backend
+      and passes the app's environment to the builder, so leaving the domain
+      here lets an app that selects a required backend stage on these cells,
+      and an app that selects none fails to stage, just as it would fail to
+      run. The buildpack compile of an app that selects a VM backend still
+      runs under oci-runc on these cells, not in a VM.
     default: ["cf-app-staging"]
   diego.rep.cell_annotations:
     description: "Map of string key-value annotations to attach to the cell presence. A deployment_guid key set to the BOSH deployment name is automatically added."

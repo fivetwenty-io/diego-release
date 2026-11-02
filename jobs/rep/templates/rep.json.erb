@@ -121,7 +121,7 @@
   required_execution_backends = p("diego.rep.required_execution_backends")
   offered_execution_backends.each do |backend|
     unless %w[oci-runc oci-gvisor vm-qemu vm-firecracker].include?(backend)
-      raise "diego.rep.execution_backends has unknown execution backend '#{backend}', allowed entries are oci-gvisor, vm-qemu, and vm-firecracker"
+      raise "diego.rep.execution_backends has unknown execution backend '#{backend}', allowed entries are oci-runc, oci-gvisor, vm-qemu, and vm-firecracker"
     end
   end
   required_execution_backends.each do |backend|

@@ -161,7 +161,7 @@ describe 'rep' do
 
       it 'fails on an unknown offered backend' do
         deployment_manifest_fragment['diego']['rep']['execution_backends'] = %w[vm-qmeu]
-        expect { rendered_template }.to raise_error(/unknown execution backend 'vm-qmeu'/)
+        expect { rendered_template }.to raise_error(/unknown execution backend 'vm-qmeu', allowed entries are oci-runc, oci-gvisor, vm-qemu, and vm-firecracker/)
       end
 
       it 'fails when a required backend is not offered' do

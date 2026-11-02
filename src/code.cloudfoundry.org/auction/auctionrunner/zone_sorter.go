@@ -50,7 +50,7 @@ func filterZones(zones []lrpByZone, lrpAuction *auctiontypes.LRPAuction) ([]lrpB
 	var zoneError error
 
 	for _, lrpZone := range zones {
-		cells, err := lrpZone.zone.filterCells(lrpAuction.PlacementConstraint, lrpAuction.ExecutionBackend, "")
+		cells, err := lrpZone.zone.filterCells(lrpAuction.PlacementConstraint, lrpAuction.ExecutionBackend, "", "")
 		if err != nil {
 			zoneError = furtherPlacementError(zoneError, err)
 			continue

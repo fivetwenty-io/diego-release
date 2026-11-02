@@ -104,16 +104,26 @@ func (a *auctionRunner) Run(signals <-chan os.Signal, ready chan<- struct{}) err
 				break
 			}
 
-			var unresolvedLRPs []auctiontypes.LRPAuction
-			var unresolvedTasks []auctiontypes.TaskAuction
-			if zonesAdvertiseExecutionBackends(zones) {
-				logger.Info("resolving-execution-backends")
-				a.delegate.ResolveExecutionBackends(logger, work.TraceID, lrpAuctions, taskAuctions)
-				lrpAuctions, unresolvedLRPs = partitionUnresolvedLRPs(lrpAuctions)
-				taskAuctions, unresolvedTasks = partitionUnresolvedTasks(taskAuctions)
-				logger.Info("resolved-execution-backends", lager.Data{
-					"unresolved-lrp-start-auctions": len(unresolvedLRPs),
-					"unresolved-task-auctions":      len(unresolvedTasks),
+			// Every round resolves backends, even when no cell in the zones
+			// advertises one. The zones leave out evacuating cells and cells
+			// whose state could not be fetched, so a round can miss the only
+			// cells that offer a VM backend, and a VM workload placed without
+			// its backend would land on a cell that refuses it.
+			logger.Info("resolving-execution-backends")
+			a.delegate.ResolveExecutionBackends(logger, work.TraceID, lrpAuctions, taskAuctions)
+			lrpAuctions, unresolvedLRPs := partitionUnresolvedLRPs(lrpAuctions)
+			taskAuctions, unresolvedTasks := partitionUnresolvedTasks(taskAuctions)
+			logger.Info("resolved-execution-backends", lager.Data{
+				"unresolved-lrp-start-auctions": len(unresolvedLRPs),
+				"unresolved-task-auctions":      len(unresolvedTasks),
+			})
+			for i := range unresolvedTasks {
+				// Rejecting the task would use one of the retries that BBS
+				// allows it, so the round leaves it pending, and BBS
+				// convergence offers it to the auctioneer again.
+				logger.Info("deferring-unresolved-task", lager.Data{
+					"task-guid": unresolvedTasks[i].TaskGuid,
+					"reason":    unresolvedTasks[i].PlacementError,
 				})
 			}
 
@@ -126,7 +136,6 @@ func (a *auctionRunner) Run(signals <-chan os.Signal, ready chan<- struct{}) err
 			scheduler := NewScheduler(a.workPool, zones, a.clock, logger, a.binPackFirstFitWeight, a.startingContainerWeight, a.startingContainerCountMaximum)
 			auctionResults := scheduler.Schedule(auctionRequest)
 			auctionResults.FailedLRPs = append(auctionResults.FailedLRPs, unresolvedLRPs...)
-			auctionResults.FailedTasks = append(auctionResults.FailedTasks, unresolvedTasks...)
 			logger.Info("scheduled", lager.Data{
 				"successful-lrp-start-auctions": len(auctionResults.SuccessfulLRPs),
 				"successful-task-auctions":      len(auctionResults.SuccessfulTasks),
@@ -143,21 +152,6 @@ func (a *auctionRunner) Run(signals <-chan os.Signal, ready chan<- struct{}) err
 			return nil
 		}
 	}
-}
-
-// zonesAdvertiseExecutionBackends reports whether any cell offers a backend
-// beyond oci-runc or requires one. When none does, every workload either runs
-// on oci-runc or fails on every cell alike, so the auction skips looking up
-// which backend each workload selects.
-func zonesAdvertiseExecutionBackends(zones map[string]Zone) bool {
-	for _, zone := range zones {
-		for _, cell := range zone {
-			if cell.AdvertisesExecutionBackends() {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func partitionUnresolvedLRPs(auctions []auctiontypes.LRPAuction) ([]auctiontypes.LRPAuction, []auctiontypes.LRPAuction) {
@@ -179,7 +173,6 @@ func partitionUnresolvedTasks(auctions []auctiontypes.TaskAuction) ([]auctiontyp
 	var unresolved []auctiontypes.TaskAuction
 	for _, auction := range auctions {
 		if auction.PlacementError != "" {
-			auction.Attempts++
 			unresolved = append(unresolved, auction)
 			continue
 		}

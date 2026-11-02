@@ -2,9 +2,11 @@ package auctionrunnerdelegate
 
 import (
 	"sync"
+	"time"
 
 	"code.cloudfoundry.org/bbs"
 	"code.cloudfoundry.org/bbs/models"
+	"code.cloudfoundry.org/clock"
 
 	"code.cloudfoundry.org/auction/auctiontypes"
 	"code.cloudfoundry.org/lager/v3"
@@ -13,19 +15,37 @@ import (
 type AuctionRunnerDelegate struct {
 	repClientFactory models.RepClientFactory
 	bbsClient        bbs.InternalClient
+	clock            clock.Clock
+
+	executionBackendLookupTimeout time.Duration
 
 	lrpBackendsLock sync.Mutex
-	lrpBackends     map[string]string
+	lrpBackends     map[string]rememberedBackend
+
+	lrpLookups  chan struct{}
+	taskLookups chan struct{}
 }
 
+// New returns a delegate. executionBackendLookupTimeout bounds how long one
+// auction round waits to learn which backend its workloads select, and a
+// value that is not positive means DefaultExecutionBackendLookupTimeout.
 func New(
 	repClientFactory models.RepClientFactory,
 	bbsClient bbs.InternalClient,
+	clock clock.Clock,
+	executionBackendLookupTimeout time.Duration,
 ) *AuctionRunnerDelegate {
+	if executionBackendLookupTimeout <= 0 {
+		executionBackendLookupTimeout = DefaultExecutionBackendLookupTimeout
+	}
 	return &AuctionRunnerDelegate{
-		repClientFactory: repClientFactory,
-		bbsClient:        bbsClient,
-		lrpBackends:      map[string]string{},
+		repClientFactory:              repClientFactory,
+		bbsClient:                     bbsClient,
+		clock:                         clock,
+		executionBackendLookupTimeout: executionBackendLookupTimeout,
+		lrpBackends:                   map[string]rememberedBackend{},
+		lrpLookups:                    make(chan struct{}, lrpLookupConcurrency),
+		taskLookups:                   make(chan struct{}, taskLookupConcurrency),
 	}
 }
 

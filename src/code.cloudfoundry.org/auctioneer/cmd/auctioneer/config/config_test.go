@@ -31,6 +31,7 @@ var _ = Describe("AuctioneerConfig", func() {
 			"bin_pack_first_fit_weight": 0.1,
 			"cell_state_timeout": "2s",
 			"communication_timeout": "15s",
+			"execution_backend_lookup_timeout": "7s",
 			"debug_address": "127.0.0.1:17017",
 			"listen_address": "0.0.0.0:9090",
 			"lock_retry_interval": "1m",
@@ -101,7 +102,8 @@ var _ = Describe("AuctioneerConfig", func() {
 				LocketClientCertFile: "locket-client-cert",
 				LocketClientKeyFile:  "locket-client-key",
 			},
-			CommunicationTimeout: durationjson.Duration(15 * time.Second),
+			CommunicationTimeout:          durationjson.Duration(15 * time.Second),
+			ExecutionBackendLookupTimeout: durationjson.Duration(7 * time.Second),
 			DebugServerConfig: debugserver.DebugServerConfig{
 				DebugAddress: "127.0.0.1:17017",
 			},

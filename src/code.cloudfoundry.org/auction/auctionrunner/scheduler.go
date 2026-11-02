@@ -17,9 +17,9 @@ import (
 type Zone []*Cell
 
 // filterCells returns the cells that match the placement constraint and that
-// offer and accept the execution backend. taskDomain is empty for an LRP. The
-// error describes the furthest check that some cell passed.
-func (z *Zone) filterCells(pc models.PlacementConstraint, backend, taskDomain string) ([]*Cell, error) {
+// offer and accept the execution backend. taskDomain and appBackend are empty
+// for an LRP. The error describes the furthest check that some cell passed.
+func (z *Zone) filterCells(pc models.PlacementConstraint, backend, taskDomain, appBackend string) ([]*Cell, error) {
 	var cells = make([]*Cell, 0, len(*z))
 	err := auctiontypes.ErrorCellMismatch
 	required := map[string]struct{}{}
@@ -36,7 +36,7 @@ func (z *Zone) filterCells(pc models.PlacementConstraint, backend, taskDomain st
 				}
 
 				if cell.MatchPlacementTags(pc.PlacementTags) {
-					backendErr := cell.MatchExecutionBackend(backend, taskDomain)
+					backendErr := cell.MatchExecutionBackend(backend, taskDomain, appBackend)
 					if backendErr == nil {
 						err = nil
 						cells = append(cells, cell)
@@ -419,7 +419,7 @@ func (s *Scheduler) scheduleTaskAuction(taskAuction *auctiontypes.TaskAuction, s
 	var zoneError error
 
 	for _, zone := range s.zones {
-		cells, err := zone.filterCells(taskAuction.PlacementConstraint, taskAuction.ExecutionBackend, taskAuction.Domain)
+		cells, err := zone.filterCells(taskAuction.PlacementConstraint, taskAuction.ExecutionBackend, taskAuction.Domain, taskAuction.AppExecutionBackend)
 		if err != nil {
 			zoneError = furtherPlacementError(zoneError, err)
 			continue

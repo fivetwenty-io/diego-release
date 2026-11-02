@@ -1,6 +1,7 @@
 package auctionrunner_test
 
 import (
+	"errors"
 	"os"
 	"sync"
 	"time"
@@ -80,11 +81,21 @@ var _ = Describe("AuctionRunner with execution backends", func() {
 		done     chan struct{}
 	)
 
-	addCell := func(name string, optionalPlacementTags []string) *repfakes.FakeSimClient {
+	addCellState := func(name string, evacuating bool, optionalPlacementTags []string) *repfakes.FakeSimClient {
 		client := &repfakes.FakeSimClient{}
-		client.StateReturns(BuildCellState(name, len(delegate.clients), "z1", 100, 100, 100, false, 0, linuxOnlyRootFSProviders, nil, []string{}, []string{}, optionalPlacementTags, 0), nil)
+		client.StateReturns(BuildCellState(name, len(delegate.clients), "z1", 100, 100, 100, evacuating, 0, linuxOnlyRootFSProviders, nil, []string{}, []string{}, optionalPlacementTags, 0), nil)
 		delegate.clients[name] = client
 		return client
+	}
+
+	addCell := func(name string, optionalPlacementTags []string) *repfakes.FakeSimClient {
+		return addCellState(name, false, optionalPlacementTags)
+	}
+
+	vmCellTags := func() []string {
+		policy, err := rep.NewExecutionBackendPolicy([]string{"vm-qemu"}, []string{"vm-qemu"}, nil)
+		Expect(err).NotTo(HaveOccurred())
+		return policy.PlacementTags()
 	}
 
 	BeforeEach(func() {
@@ -130,21 +141,72 @@ var _ = Describe("AuctionRunner with execution backends", func() {
 		return results
 	}
 
-	Context("when no cell advertises an execution backend policy", func() {
+	Context("when no cell in the zones advertises an execution backend policy", func() {
+		var oldClient *repfakes.FakeSimClient
+
 		BeforeEach(func() {
-			addCell("old-cell", []string{"some-optional-tag"})
+			oldClient = addCell("old-cell", []string{"some-optional-tag"})
 		})
 
-		It("does not look up execution backends and schedules as before", func() {
+		It("still looks up the backends and schedules workloads that select none as before", func() {
+			delegate.lrpBackends["pg-1"] = ""
+
 			results := auction(
 				[]models.LRPStartRequest{BuildLRPStartRequest("pg-1", "domain", []int{0}, linuxRootFSURL, 10, 10, 10, []string{}, []string{})},
 				nil,
 			)
 
-			Expect(delegate.ResolveCallCount()).To(Equal(0))
+			Expect(delegate.ResolveCallCount()).To(Equal(1))
 			Expect(results.FailedLRPs).To(BeEmpty())
 			Expect(results.SuccessfulLRPs).To(HaveLen(1))
 			Expect(results.SuccessfulLRPs[0].Winner).To(Equal("old-cell"))
+		})
+
+		Context("because the only cell that offers a VM backend is evacuating", func() {
+			BeforeEach(func() {
+				addCellState("vm-cell", true, vmCellTags())
+			})
+
+			It("does not place a VM workload on a cell that does not offer its backend", func() {
+				delegate.lrpBackends["pg-vm"] = "vm-qemu"
+				delegate.taskBackends["tg-vm"] = "vm-qemu"
+
+				results := auction(
+					[]models.LRPStartRequest{BuildLRPStartRequest("pg-vm", "domain", []int{0}, linuxRootFSURL, 10, 10, 10, []string{}, []string{})},
+					[]models.TaskStartRequest{BuildTaskStartRequest("tg-vm", "domain", linuxRootFSURL, 10, 10, 10)},
+				)
+
+				Expect(delegate.ResolveCallCount()).To(Equal(1))
+				Expect(results.SuccessfulLRPs).To(BeEmpty())
+				Expect(results.FailedLRPs).To(HaveLen(1))
+				Expect(results.FailedLRPs[0].PlacementError).To(Equal(`found no compatible cell offering execution backend "vm-qemu"`))
+				Expect(results.SuccessfulTasks).To(BeEmpty())
+				Expect(results.FailedTasks).To(HaveLen(1))
+				Expect(results.FailedTasks[0].PlacementError).To(Equal(`found no compatible cell offering execution backend "vm-qemu"`))
+				Expect(oldClient.PerformCallCount()).To(Equal(0))
+			})
+		})
+
+		Context("because the only cell that offers a VM backend did not report its state", func() {
+			BeforeEach(func() {
+				vmClient := addCell("vm-cell", vmCellTags())
+				vmClient.StateReturns(models.CellState{}, errors.New("cell unreachable"))
+			})
+
+			It("does not place a VM workload on a cell that does not offer its backend", func() {
+				delegate.lrpBackends["pg-vm"] = "vm-qemu"
+
+				results := auction(
+					[]models.LRPStartRequest{BuildLRPStartRequest("pg-vm", "domain", []int{0}, linuxRootFSURL, 10, 10, 10, []string{}, []string{})},
+					nil,
+				)
+
+				Expect(delegate.ResolveCallCount()).To(Equal(1))
+				Expect(results.SuccessfulLRPs).To(BeEmpty())
+				Expect(results.FailedLRPs).To(HaveLen(1))
+				Expect(results.FailedLRPs[0].PlacementError).To(Equal(`found no compatible cell offering execution backend "vm-qemu"`))
+				Expect(oldClient.PerformCallCount()).To(Equal(0))
+			})
 		})
 	})
 
@@ -177,7 +239,7 @@ var _ = Describe("AuctionRunner with execution backends", func() {
 			Expect(oldClient.PerformCallCount()).To(Equal(0))
 		})
 
-		It("fails the auctions whose backend it cannot resolve without scheduling them", func() {
+		It("fails the LRP auctions and leaves the task auctions pending whose backend it cannot resolve, without scheduling them", func() {
 			delegate.lrpBackends["pg-known"] = ""
 			delegate.taskBackends["tg-known"] = "oci-gvisor"
 
@@ -204,10 +266,10 @@ var _ = Describe("AuctionRunner with execution backends", func() {
 			Expect(results.SuccessfulTasks[0].TaskGuid).To(Equal("tg-known"))
 			Expect(results.SuccessfulTasks[0].Winner).To(Equal("gvisor-cell"))
 
-			Expect(results.FailedTasks).To(HaveLen(1))
-			Expect(results.FailedTasks[0].TaskGuid).To(Equal("tg-missing"))
-			Expect(results.FailedTasks[0].Attempts).To(Equal(1))
-			Expect(results.FailedTasks[0].PlacementError).To(Equal("unable to determine execution backend: boom"))
+			// A failed task auction makes the auctioneer reject the task, which
+			// uses up one of its retries, so the round leaves an unresolved
+			// task out of the results and BBS offers it again.
+			Expect(results.FailedTasks).To(BeEmpty())
 
 			for _, client := range []*repfakes.FakeSimClient{gvisorClient, oldClient} {
 				for i := 0; i < client.PerformCallCount(); i++ {

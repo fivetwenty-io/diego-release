@@ -44,7 +44,7 @@ func (e PlacementTagMismatchError) Error() string {
 // ExecutionBackendMismatchError is the placement error for a workload whose
 // execution backend no cell offers or accepts, among the cells that match its
 // rootfs, volume drivers, and placement tags. Required lists the backends that
-// such cells require when they offer the backend but do not accept it.
+// the cells which offer the backend, but do not accept it, require.
 type ExecutionBackendMismatchError struct {
 	Backend  string
 	Required []string
@@ -54,7 +54,7 @@ func (e ExecutionBackendMismatchError) Error() string {
 	if len(e.Required) == 0 {
 		return "found no compatible cell offering execution backend \"" + e.Backend + "\""
 	}
-	return "found no compatible cell accepting execution backend \"" + e.Backend + "\", the matching cells require " + rep.QuoteExecutionBackends(e.Required)
+	return "found no compatible cell accepting execution backend \"" + e.Backend + "\", the cells that offer it require " + rep.QuoteExecutionBackends(e.Required)
 }
 
 var ErrorNothingToStop = errors.New("nothing to stop")
@@ -73,8 +73,9 @@ type AuctionRunnerDelegate interface {
 	AuctionCompleted(lager.Logger, string, AuctionResults)
 
 	// ResolveExecutionBackends sets the ExecutionBackend of every auction to
-	// the backend that its workload selects. When it cannot tell, it sets the
-	// auction's PlacementError instead, and the auction is not scheduled.
+	// the backend that its workload selects, and the AppExecutionBackend of
+	// every task auction. When it cannot tell in time, it sets the auction's
+	// PlacementError instead, and the auction is not scheduled in this round.
 	ResolveExecutionBackends(logger lager.Logger, traceID string, lrps []LRPAuction, tasks []TaskAuction)
 }
 
@@ -134,11 +135,14 @@ func (a *LRPAuction) Copy() LRPAuction {
 }
 
 // TaskAuction is one task to place. ExecutionBackend has the same meaning as
-// it does for an LRPAuction.
+// it does for an LRPAuction. AppExecutionBackend is the backend that the app a
+// staging task builds selects, which a cell checks for a task in a domain
+// that is exempt from its requirement.
 type TaskAuction struct {
 	bbsmodels.SchedulingTask
 	AuctionRecord
-	ExecutionBackend string
+	ExecutionBackend    string
+	AppExecutionBackend string
 }
 
 func NewTaskAuction(task bbsmodels.SchedulingTask, now time.Time) TaskAuction {
@@ -149,5 +153,5 @@ func NewTaskAuction(task bbsmodels.SchedulingTask, now time.Time) TaskAuction {
 }
 
 func (a *TaskAuction) Copy() TaskAuction {
-	return TaskAuction{a.SchedulingTask.Copy(), a.AuctionRecord, a.ExecutionBackend}
+	return TaskAuction{a.SchedulingTask.Copy(), a.AuctionRecord, a.ExecutionBackend, a.AppExecutionBackend}
 }
