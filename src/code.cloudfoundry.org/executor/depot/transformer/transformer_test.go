@@ -153,6 +153,48 @@ var _ = Describe("Transformer", func() {
 			)
 		})
 
+		Describe("CF_VM_STOP_GRACE_SECONDS", func() {
+			var actionEnv []string
+
+			BeforeEach(func() {
+				actionEnv = nil
+				gardenContainer.RunStub = func(processSpec garden.ProcessSpec, processIO garden.ProcessIO) (garden.Process, error) {
+					if processSpec.Path == "/action/path" {
+						actionEnv = processSpec.Env
+					}
+					return &gardenfakes.FakeProcess{}, nil
+				}
+			})
+
+			runAction := func() {
+				runner, _, err := optimusPrime.StepsRunner(logger, container, gardenContainer, logStreamer, cfg)
+				Expect(err).NotTo(HaveOccurred())
+				ifrit.Background(runner)
+				Eventually(func() []string { return actionEnv }).ShouldNot(BeNil())
+			}
+
+			DescribeTable("on a VM backend",
+				func(backend string) {
+					container.ExecutionBackend = backend
+					runAction()
+					Expect(actionEnv).To(ContainElement("CF_VM_STOP_GRACE_SECONDS=10"))
+				},
+				Entry("qemu", "vm-qemu"),
+				Entry("firecracker", "vm-firecracker"),
+			)
+
+			DescribeTable("on a container that is not on a VM backend",
+				func(backend string) {
+					container.ExecutionBackend = backend
+					runAction()
+					Expect(actionEnv).NotTo(ContainElement(HavePrefix("CF_VM_STOP_GRACE_SECONDS=")))
+				},
+				Entry("no backend selected", ""),
+				Entry("runc", "runc"),
+				Entry("gvisor", "gvisor"),
+			)
+		})
+
 		Context("when there is no run action", func() {
 			BeforeEach(func() {
 				container.Action = nil

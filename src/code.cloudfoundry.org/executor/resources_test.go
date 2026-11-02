@@ -120,4 +120,19 @@ var _ = Describe("execution backend selection", func() {
 	It("uses the Garden property key that Garden reads", func() {
 		Expect(executor.ExecutionBackendProperty).To(Equal("garden.execution-backend"))
 	})
+
+	It("uses the environment variable name the VM launcher reads for the stop grace interval", func() {
+		Expect(executor.StopGraceSecondsEnvVar).To(Equal("CF_VM_STOP_GRACE_SECONDS"))
+	})
+
+	DescribeTable("which backend names count as a VM",
+		func(backend string, isVM bool) {
+			Expect(executor.IsVMExecutionBackend(backend)).To(Equal(isVM))
+		},
+		Entry("qemu", "vm-qemu", true),
+		Entry("firecracker", "vm-firecracker", true),
+		Entry("runc", "runc", false),
+		Entry("gvisor", "gvisor", false),
+		Entry("empty", "", false),
+	)
 })

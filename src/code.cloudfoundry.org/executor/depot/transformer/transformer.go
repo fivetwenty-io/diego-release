@@ -71,6 +71,8 @@ type transformer struct {
 
 	postSetupHook []string
 	postSetupUser string
+
+	passStopGrace bool
 }
 
 type Option func(*transformer)
@@ -170,7 +172,7 @@ func (t *transformer) stepFor(
 	a := action.GetValue()
 	switch actionModel := a.(type) {
 	case *models.RunAction:
-		return steps.NewRun(
+		runStep := steps.NewRun(
 			container,
 			*actionModel,
 			logStreamer.WithSource(actionModel.LogSource),
@@ -183,6 +185,10 @@ func (t *transformer) stepFor(
 			t.gracefulShutdownInterval,
 			suppressExitStatusCode,
 		)
+		if t.passStopGrace {
+			runStep.WithStopGrace()
+		}
+		return runStep
 
 	case *models.DownloadAction:
 		return steps.NewDownload(
@@ -396,6 +402,14 @@ func (t *transformer) StepsRunner(
 ) (ifrit.Runner, chan steps.ReadinessState, error) {
 	var setup, action, postSetup, monitor, readinessMonitor, longLivedAction ifrit.Runner
 	var substeps []ifrit.Runner
+
+	if executor.IsVMExecutionBackend(container.ExecutionBackend) {
+		// The transformer is shared by every container, so a VM container gets
+		// its own copy that tells run steps to pass the stop grace interval.
+		vmTransformer := *t
+		vmTransformer.passStopGrace = true
+		t = &vmTransformer
+	}
 
 	if container.Setup != nil {
 		setup = t.stepFor(

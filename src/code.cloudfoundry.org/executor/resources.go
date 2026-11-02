@@ -18,7 +18,20 @@ const (
 	// ExecutionBackendProperty is the Garden container property that carries the
 	// selected execution backend to the Garden server.
 	ExecutionBackendProperty = "garden.execution-backend"
+	// StopGraceSecondsEnvVar is the process environment variable that carries
+	// the graceful shutdown interval, in whole seconds, to the VM launcher so
+	// that it can size its stop deadline. Only VM backends receive it.
+	StopGraceSecondsEnvVar = "CF_VM_STOP_GRACE_SECONDS"
 )
+
+// IsVMExecutionBackend reports whether the backend name selects a VM execution
+// backend.
+//
+// This is a copy of guardian's backend.IsVM, which the executor cannot import.
+// Change the two together. The rep keeps its own copy for the same reason.
+func IsVMExecutionBackend(backend string) bool {
+	return backend == "vm-qemu" || backend == "vm-firecracker"
+}
 
 type State string
 
