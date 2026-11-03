@@ -18,7 +18,33 @@ const (
 	// ExecutionBackendProperty is the Garden container property that carries the
 	// selected execution backend to the Garden server.
 	ExecutionBackendProperty = "garden.execution-backend"
+	// StopGraceSecondsEnvVar is the process environment variable that carries
+	// the graceful shutdown interval, in whole seconds, to the VM launcher so
+	// that it can size its stop deadline. Only VM backends receive it.
+	StopGraceSecondsEnvVar = "CF_VM_STOP_GRACE_SECONDS"
+	// SSHDPath is the SSH daemon that Cloud Controller runs beside the app.
+	SSHDPath = "/tmp/lifecycle/diego-sshd"
+	// SSHDVMContainerMarker tells diego-sshd that it runs in the container of
+	// a VM backend, where the app runs in the guest and only the platform
+	// runs in the container. The executor appends it to the SSH daemon's
+	// arguments in the main action of a VM container, and nowhere else. It is
+	// a bare trailing word, not a flag, so that a diego-sshd from before the
+	// marker existed stops parsing flags at it and runs as it always did,
+	// where an unknown flag would make that daemon exit. Cloud Controller
+	// builds the other arguments itself, so no app setting reaches them, and
+	// the marker is how diego-sshd knows that it may trust the guest agent's
+	// relay socket.
+	SSHDVMContainerMarker = "vm-container"
 )
+
+// IsVMExecutionBackend reports whether the backend name selects a VM execution
+// backend.
+//
+// This is a copy of guardian's backend.IsVM, which the executor cannot import.
+// Change the two together. The rep keeps its own copy for the same reason.
+func IsVMExecutionBackend(backend string) bool {
+	return backend == "vm-qemu" || backend == "vm-firecracker"
+}
 
 type State string
 

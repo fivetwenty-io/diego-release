@@ -39,7 +39,7 @@ var _ = Describe("OrdinaryLRPProcessor", func() {
 		containerDelegate = new(fake_internal.FakeContainerDelegate)
 		evacuationReporter = &fake_evacuation_context.FakeEvacuationReporter{}
 		evacuationReporter.EvacuatingReturns(false)
-		processor = internal.NewLRPProcessor(bbsClient, containerDelegate, nil, expectedCellID, expectedAvailabilityZone, rep.StackPathMap{}, "", evacuationReporter)
+		processor = internal.NewLRPProcessor(bbsClient, containerDelegate, nil, expectedCellID, expectedAvailabilityZone, rep.StackPathMap{}, "", evacuationReporter, nil)
 		logger = lagertest.NewTestLogger("test")
 	})
 
@@ -136,15 +136,15 @@ var _ = Describe("OrdinaryLRPProcessor", func() {
 
 				Context("when the LRP selects a VM backend and has sidecars", func() {
 					BeforeEach(func() {
-						launcher := func(env ...*models.EnvironmentVariable) *models.Action {
+						launcher := func(user string, env ...*models.EnvironmentVariable) *models.Action {
 							return models.WrapAction(&models.RunAction{
 								Path: "/tmp/lifecycle/launcher",
-								User: "vcap",
+								User: user,
 								Env:  env,
 							})
 						}
-						desiredLRP.Action = launcher(&models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "vm-qemu"})
-						desiredLRP.Sidecars = []*models.Sidecar{{Action: launcher()}}
+						desiredLRP.Action = launcher("vcap", &models.EnvironmentVariable{Name: "CF_EXECUTION_BACKEND", Value: "vm-qemu"})
+						desiredLRP.Sidecars = []*models.Sidecar{{Action: launcher("root")}}
 					})
 
 					It("does not try to run the container", func() {
@@ -186,7 +186,7 @@ var _ = Describe("OrdinaryLRPProcessor", func() {
 
 				Context("when the LRP selects a VM backend with a rootfs that is not preloaded", func() {
 					BeforeEach(func() {
-						desiredLRP.RootFs = "docker:///cloudfoundry/test"
+						desiredLRP.RootFs = "oci:///some/image"
 						desiredLRP.Action = models.WrapAction(&models.RunAction{
 							Path: "/tmp/lifecycle/launcher",
 							User: "vcap",
@@ -247,6 +247,82 @@ var _ = Describe("OrdinaryLRPProcessor", func() {
 					It("runs the container and does not crash the LRP", func() {
 						Expect(containerDelegate.RunContainerCallCount()).To(Equal(1))
 						Expect(bbsClient.CrashActualLRPCallCount()).To(Equal(0))
+					})
+				})
+
+				Context("when the cell has an execution backend policy", func() {
+					var policy rep.ExecutionBackendPolicy
+
+					BeforeEach(func() {
+						processor = internal.NewLRPProcessor(bbsClient, containerDelegate, nil, expectedCellID, expectedAvailabilityZone, rep.StackPathMap{}, "", evacuationReporter, &policy)
+					})
+
+					Context("and the cell does not offer the backend that the LRP selects", func() {
+						BeforeEach(func() {
+							var err error
+							policy, err = rep.NewExecutionBackendPolicy([]string{"oci-gvisor"}, nil, nil)
+							Expect(err).NotTo(HaveOccurred())
+							desiredLRP.RootFs = "docker:///cloudfoundry/test"
+							desiredLRP.Action = models.WrapAction(&models.RunAction{
+								Path: "/tmp/lifecycle/launcher",
+								User: "vcap",
+								Env:  []*models.EnvironmentVariable{{Name: "CF_EXECUTION_BACKEND", Value: "vm-firecracker"}},
+							})
+							desiredLRP.Sidecars = nil
+						})
+
+						It("does not try to run the container", func() {
+							Expect(containerDelegate.RunContainerCallCount()).To(Equal(0))
+						})
+
+						It("crashes the actual LRP with the refusal as the reason", func() {
+							Expect(bbsClient.CrashActualLRPCallCount()).To(Equal(1))
+							_, _, actualLRPKey, instanceKey, reason := bbsClient.CrashActualLRPArgsForCall(0)
+							Expect(actualLRPKey.ProcessGuid).To(Equal(expectedLrpKey.ProcessGuid))
+							Expect(*instanceKey).To(Equal(expectedInstanceKey))
+							Expect(reason).To(ContainSubstring(rep.ErrExecutionBackendNotOffered.Error()))
+							Expect(reason).To(ContainSubstring(`"vm-firecracker"`))
+						})
+
+						It("deletes the reserved container", func() {
+							Expect(containerDelegate.DeleteContainerCallCount()).To(Equal(1))
+						})
+					})
+
+					Context("and the cell offers the backend that the LRP selects", func() {
+						BeforeEach(func() {
+							var err error
+							policy, err = rep.NewExecutionBackendPolicy([]string{"oci-gvisor"}, nil, nil)
+							Expect(err).NotTo(HaveOccurred())
+							desiredLRP.RootFs = "docker:///cloudfoundry/test"
+							desiredLRP.Action = models.WrapAction(&models.RunAction{
+								Path: "/tmp/lifecycle/launcher",
+								User: "vcap",
+								Env:  []*models.EnvironmentVariable{{Name: "CF_EXECUTION_BACKEND", Value: "oci-gvisor"}},
+							})
+							desiredLRP.Sidecars = nil
+						})
+
+						It("runs the container", func() {
+							Expect(containerDelegate.RunContainerCallCount()).To(Equal(1))
+							Expect(bbsClient.CrashActualLRPCallCount()).To(Equal(0))
+						})
+					})
+
+					Context("and the cell requires a backend that the LRP does not select", func() {
+						BeforeEach(func() {
+							var err error
+							policy, err = rep.NewExecutionBackendPolicy([]string{"oci-gvisor"}, []string{"oci-gvisor"}, []string{"cf-app-staging"})
+							Expect(err).NotTo(HaveOccurred())
+						})
+
+						It("crashes the actual LRP and names what the cell requires", func() {
+							Expect(containerDelegate.RunContainerCallCount()).To(Equal(0))
+							Expect(bbsClient.CrashActualLRPCallCount()).To(Equal(1))
+							_, _, _, _, reason := bbsClient.CrashActualLRPArgsForCall(0)
+							Expect(reason).To(ContainSubstring(rep.ErrExecutionBackendNotAccepted.Error()))
+							Expect(reason).To(ContainSubstring(`this cell requires "oci-gvisor"`))
+						})
 					})
 				})
 

@@ -135,6 +135,21 @@ func main() {
 		sidecarRootFSPath = path
 	}
 
+	// The cell advertises its execution backend policy through reserved
+	// optional placement tags, so the auctioneer places a workload only on a
+	// cell that offers and accepts the backend the workload selects.
+	executionBackendPolicy, err := rep.NewExecutionBackendPolicy(repConfig.ExecutionBackends, repConfig.RequiredExecutionBackends, repConfig.ExecutionBackendExemptDomains)
+	if err != nil {
+		logger.Fatal("invalid-execution-backend-policy", err)
+	}
+	for _, tag := range append(append([]string{}, repConfig.PlacementTags...), repConfig.OptionalPlacementTags...) {
+		if rep.IsExecutionBackendPlacementTag(tag) {
+			logger.Fatal("reserved-placement-tag", fmt.Errorf("placement tag %q uses the reserved prefix %q", tag, rep.ExecutionBackendTagPrefix))
+		}
+	}
+	repConfig.OptionalPlacementTags = append(append([]string{}, repConfig.OptionalPlacementTags...), executionBackendPolicy.PlacementTags()...)
+	logger.Info("execution-backend-policy", lager.Data{"placement-tags": executionBackendPolicy.PlacementTags()})
+
 	preloadedRootFSesWithVersions := rep.StackPathMap(preloadedRootFSes).StackVersionList()
 	extraRootFSesWithVersions := extraRootFSes.StackVersionList()
 
@@ -217,6 +232,7 @@ func main() {
 		executorClient,
 		metronClient,
 		evacuationReporter,
+		&executionBackendPolicy,
 	)
 
 	cleanup := evacuation.NewEvacuationCleanup(

@@ -294,6 +294,13 @@ var _ = Describe("RunAction", func() {
 			})
 		})
 
+		Context("CF_VM_STOP_GRACE_SECONDS", func() {
+			It("is not set by default", func() {
+				_, spec, _ := gardenClient.Connection.RunArgsForCall(0)
+				Expect(spec.Env).NotTo(ContainElement(HavePrefix("CF_VM_STOP_GRACE_SECONDS=")))
+			})
+		})
+
 		Context("CF_INSTANCE_* networking env vars", func() {
 			It("sets CF_INSTANCE_IP on the container", func() {
 				_, spec, _ := gardenClient.Connection.RunArgsForCall(0)
@@ -838,6 +845,74 @@ var _ = Describe("RunAction", func() {
 				Expect(gardenClient.Connection.RunCallCount()).To(Equal(0))
 				Consistently(ready).ShouldNot(BeClosed())
 			})
+		})
+	})
+})
+
+var _ = Describe("RunStep with the stop grace interval", func() {
+	var (
+		gardenClient *fakes.FakeGardenClient
+		step         ifrit.Runner
+		interval     time.Duration
+	)
+
+	BeforeEach(func() {
+		gardenClient = fakes.NewGardenClient()
+		gardenClient.Connection.CreateReturns("some-container-handle", nil)
+		gardenClient.Connection.RunStub = func(string, garden.ProcessSpec, garden.ProcessIO) (garden.Process, error) {
+			process := new(gardenfakes.FakeProcess)
+			process.WaitReturns(0, nil)
+			return process, nil
+		}
+		interval = 15 * time.Second
+	})
+
+	JustBeforeEach(func() {
+		container, err := gardenClient.Create(garden.ContainerSpec{})
+		Expect(err).NotTo(HaveOccurred())
+
+		runStep := steps.NewRun(
+			container,
+			models.RunAction{Path: "/some/path"},
+			fake_log_streamer.NewFakeLogStreamer(),
+			lagertest.NewTestLogger("test"),
+			"external-ip",
+			"internal-ip",
+			"",
+			nil,
+			fakeclock.NewFakeClock(time.Unix(123, 456)),
+			interval,
+			false,
+		)
+		step = runStep.WithStopGrace()
+		process := ifrit.Background(step)
+		Eventually(process.Wait()).Should(Receive())
+	})
+
+	It("passes the interval in whole seconds", func() {
+		_, spec, _ := gardenClient.Connection.RunArgsForCall(0)
+		Expect(spec.Env).To(ContainElement("CF_VM_STOP_GRACE_SECONDS=15"))
+	})
+
+	Context("when the interval is a positive fraction of a second", func() {
+		BeforeEach(func() {
+			interval = 400 * time.Millisecond
+		})
+
+		It("passes one second", func() {
+			_, spec, _ := gardenClient.Connection.RunArgsForCall(0)
+			Expect(spec.Env).To(ContainElement("CF_VM_STOP_GRACE_SECONDS=1"))
+		})
+	})
+
+	Context("when the interval is zero", func() {
+		BeforeEach(func() {
+			interval = 0
+		})
+
+		It("leaves the variable out so the launcher keeps its default", func() {
+			_, spec, _ := gardenClient.Connection.RunArgsForCall(0)
+			Expect(spec.Env).NotTo(ContainElement(HavePrefix("CF_VM_STOP_GRACE_SECONDS=")))
 		})
 	})
 })

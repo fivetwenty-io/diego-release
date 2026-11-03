@@ -135,6 +135,57 @@ describe 'rep' do
       end
     end
 
+    context 'execution backends' do
+      it 'offers only oci-runc and requires nothing by default' do
+        rendered = JSON.parse(rendered_template)
+        expect(rendered['execution_backends']).to eq([])
+        expect(rendered['required_execution_backends']).to eq([])
+        expect(rendered['required_execution_backends_exempt_task_domains']).to eq(%w[cf-app-staging])
+      end
+
+      it 'renders the offered and required backends and the exempt task domains' do
+        deployment_manifest_fragment['diego']['rep']['execution_backends'] = %w[vm-qemu vm-firecracker]
+        deployment_manifest_fragment['diego']['rep']['required_execution_backends'] = %w[vm-qemu vm-firecracker]
+        deployment_manifest_fragment['diego']['rep']['required_execution_backends_exempt_task_domains'] = %w[cf-app-staging cf-tasks]
+        rendered = JSON.parse(rendered_template)
+        expect(rendered['execution_backends']).to eq(%w[vm-qemu vm-firecracker])
+        expect(rendered['required_execution_backends']).to eq(%w[vm-qemu vm-firecracker])
+        expect(rendered['required_execution_backends_exempt_task_domains']).to eq(%w[cf-app-staging cf-tasks])
+      end
+
+      it 'allows oci-runc in the required backends without offering it' do
+        deployment_manifest_fragment['diego']['rep']['execution_backends'] = %w[oci-gvisor]
+        deployment_manifest_fragment['diego']['rep']['required_execution_backends'] = %w[oci-runc oci-gvisor]
+        expect(JSON.parse(rendered_template)['required_execution_backends']).to eq(%w[oci-runc oci-gvisor])
+      end
+
+      it 'fails on an unknown offered backend' do
+        deployment_manifest_fragment['diego']['rep']['execution_backends'] = %w[vm-qmeu]
+        expect { rendered_template }.to raise_error(/unknown execution backend 'vm-qmeu', allowed entries are oci-runc, oci-gvisor, vm-qemu, and vm-firecracker/)
+      end
+
+      it 'fails when a required backend is not offered' do
+        deployment_manifest_fragment['diego']['rep']['execution_backends'] = %w[vm-qemu]
+        deployment_manifest_fragment['diego']['rep']['required_execution_backends'] = %w[vm-firecracker]
+        expect { rendered_template }.to raise_error(/'vm-firecracker', which is not in diego.rep.execution_backends/)
+      end
+
+      it 'fails on an empty exempt task domain' do
+        deployment_manifest_fragment['diego']['rep']['required_execution_backends_exempt_task_domains'] = ['']
+        expect { rendered_template }.to raise_error(/empty task domain/)
+      end
+
+      it 'fails when a placement tag uses the reserved prefix' do
+        deployment_manifest_fragment['diego']['rep']['placement_tags'] = %w[execution-backend.offered:vm-qemu]
+        expect { rendered_template }.to raise_error(/reserved for the execution backend policy/)
+      end
+
+      it 'fails when an optional placement tag uses the reserved prefix' do
+        deployment_manifest_fragment['diego']['rep']['optional_placement_tags'] = %w[execution-backend.required:vm-qemu]
+        expect { rendered_template }.to raise_error(/reserved for the execution backend policy/)
+      end
+    end
+
     context 'cell_annotations' do
       it 'includes the deployment_guid based on the bosh deployment name' do
         expect(JSON.parse(rendered_template)['cell_annotations']).to eq('deployment_guid' => 'my-deployment')

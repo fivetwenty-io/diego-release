@@ -11,8 +11,15 @@ import (
 	"github.com/tedsuo/ifrit"
 )
 
+// guestAgentDir is where the sshd that the specs build looks for the guest
+// agent's socket, relative to its working directory. The specs' sshd thus
+// never sees a socket at the standard path on the host (see
+// guest_agent_test.go).
+const guestAgentDir = "guest-agent"
+
 func buildSshd() string {
-	sshd, err := gexec.Build("code.cloudfoundry.org/diego-ssh/cmd/sshd", "-race")
+	ldflags := fmt.Sprintf("-X main.guestAgentSocketPath=%s/vm-launch-agent.sock", guestAgentDir)
+	sshd, err := gexec.Build("code.cloudfoundry.org/diego-ssh/cmd/sshd", "-race", "-ldflags", ldflags)
 	Expect(err).NotTo(HaveOccurred())
 	return sshd
 }

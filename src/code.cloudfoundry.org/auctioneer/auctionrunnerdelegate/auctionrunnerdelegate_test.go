@@ -2,10 +2,12 @@ package auctionrunnerdelegate_test
 
 import (
 	"errors"
+	"time"
 
 	"code.cloudfoundry.org/auction/auctiontypes"
 	"code.cloudfoundry.org/bbs/fake_bbs"
 	"code.cloudfoundry.org/bbs/models"
+	"code.cloudfoundry.org/clock/fakeclock"
 
 	"code.cloudfoundry.org/rep/repfakes"
 
@@ -35,7 +37,7 @@ var _ = Describe("Auction Runner Delegate", func() {
 		repClientFactory.CreateClientReturns(repClient, nil)
 		logger = lagertest.NewTestLogger("delegate")
 
-		delegate = auctionrunnerdelegate.New(repClientFactory, bbsClient)
+		delegate = auctionrunnerdelegate.New(repClientFactory, bbsClient, fakeclock.NewFakeClock(time.Now()), time.Second)
 	})
 
 	Describe("fetching cell reps", func() {

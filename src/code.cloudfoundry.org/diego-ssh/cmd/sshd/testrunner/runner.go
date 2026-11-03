@@ -18,10 +18,11 @@ type Args struct {
 	AllowedHostKeyAlgorithms    string
 	AllowUnauthenticatedClients bool
 	InheritDaemonEnv            bool
+	VMContainer                 bool
 }
 
 func (args Args) ArgSlice() []string {
-	return []string{
+	argSlice := []string{
 		"-address=" + args.Address,
 		"-hostKey=" + args.HostKey,
 		"-authorizedKey=" + args.AuthorizedKey,
@@ -32,6 +33,12 @@ func (args Args) ArgSlice() []string {
 		"-allowUnauthenticatedClients=" + strconv.FormatBool(args.AllowUnauthenticatedClients),
 		"-inheritDaemonEnv=" + strconv.FormatBool(args.InheritDaemonEnv),
 	}
+	// The executor appends the marker as a bare trailing word, and only in a
+	// VM container.
+	if args.VMContainer {
+		argSlice = append(argSlice, "vm-container")
+	}
+	return argSlice
 }
 
 func New(binPath string, args Args) *ginkgomon.Runner {

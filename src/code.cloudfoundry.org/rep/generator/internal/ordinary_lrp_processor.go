@@ -28,8 +28,9 @@ func newOrdinaryLRPProcessor(
 	availabilityZone string,
 	stackPathMap rep.StackPathMap,
 	layeringMode string,
+	executionBackendPolicy *rep.ExecutionBackendPolicy,
 ) LRPProcessor {
-	runRequestConversionHelper := rep.RunRequestConversionHelper{ECRHelper: ecrhelper.NewECRHelper()}
+	runRequestConversionHelper := rep.RunRequestConversionHelper{ECRHelper: ecrhelper.NewECRHelper(), ExecutionBackendPolicy: executionBackendPolicy}
 
 	return &ordinaryLRPProcessor{
 		bbsClient:                  bbsClient,
@@ -97,7 +98,7 @@ func (p *ordinaryLRPProcessor) processReservedContainer(logger lager.Logger, tra
 	runReq, err := p.runRequestConversionHelper.NewRunRequestFromDesiredLRP(lrpContainer.Guid, desired, lrpContainer.ActualLRPKey, lrpContainer.ActualLRPInstanceKey, p.stackPathMap, p.layeringMode)
 	if err != nil {
 		logger.Error("failed-to-construct-run-request", err)
-		if errors.Is(err, rep.ErrVMBackendSidecars) || errors.Is(err, rep.ErrVMBackendRootFS) {
+		if errors.Is(err, rep.ErrVMBackendSidecars) || errors.Is(err, rep.ErrVMBackendRootFS) || rep.IsExecutionBackendPolicyError(err) {
 			p.crashUnrunnableLRP(logger, traceID, lrpContainer, err)
 		}
 		return

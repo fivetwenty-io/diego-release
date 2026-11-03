@@ -764,6 +764,12 @@ var _ = Describe("Resources", func() {
 			})
 
 			Describe("the execution backend", func() {
+				BeforeEach(func() {
+					// The default sidecars do not run through the launcher, which
+					// a VM backend refuses.
+					desiredLRP.Sidecars = nil
+				})
+
 				runRequest := func() executor.RunRequest {
 					runReq, err := runRequestConversionHelper.NewRunRequestFromDesiredLRP(containerGuid, desiredLRP, &actualLRP.ActualLRPKey, &actualLRP.ActualLRPInstanceKey, stackPathMap, rep.LayeringModeSingleLayer)
 					Expect(err).NotTo(HaveOccurred())
@@ -932,7 +938,7 @@ var _ = Describe("Resources", func() {
 						// treats as VMs. A rename or a new kind there has to
 						// change this list and isVMBackend together.
 						DescribeTable("which backend names count as a VM",
-							func(name string, rejected bool) {
+							func(name string, folded bool) {
 								var env []*models.EnvironmentVariable
 								if name != "" {
 									env = backendEnv(name)
@@ -940,11 +946,18 @@ var _ = Describe("Resources", func() {
 								desiredLRP.Action = wrap(launcher(env...))
 								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher(env...))}}
 
-								_, err := sidecarRequest()
-								if rejected {
-									Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
+								runReq, err := sidecarRequest()
+								Expect(err).NotTo(HaveOccurred())
+								Expect(runReq.RunInfo.Sidecars).To(HaveLen(1))
+								relay, isRun := models.UnwrapAction(runReq.RunInfo.Sidecars[0].Action).(*models.RunAction)
+								Expect(isRun).To(BeTrue())
+								if folded {
+									Expect(relay.Env).To(HaveLen(1))
+									Expect(relay.Env[0].Name).To(Equal("CF_VM_SIDECAR_RELAY"))
 								} else {
-									Expect(err).NotTo(HaveOccurred())
+									for _, v := range relay.Env {
+										Expect(v.Name).NotTo(Equal("CF_VM_SIDECAR_RELAY"))
+									}
 								}
 							},
 							Entry("vm-qemu", "vm-qemu", true),
@@ -959,10 +972,12 @@ var _ = Describe("Resources", func() {
 								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher(backendEnv("vm-qemu")...))}}
 							})
 
-							It("fails the conversion naming the sidecar limitation", func() {
-								_, err := sidecarRequest()
-								Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
-								Expect(err).To(MatchError(ContainSubstring("VM execution backends do not support sidecars")))
+							It("folds the sidecar into the app's launcher action", func() {
+								runReq, err := sidecarRequest()
+								Expect(err).NotTo(HaveOccurred())
+								Expect(runReq.RunInfo.Sidecars).To(HaveLen(1))
+								run := models.UnwrapAction(runReq.RunInfo.Action).(*models.RunAction)
+								Expect(run.Env[len(run.Env)-2].Name).To(Equal("CF_VM_SIDECARS"))
 							})
 						})
 
@@ -971,6 +986,24 @@ var _ = Describe("Resources", func() {
 								desiredLRP.Action = wrap(models.Codependent(
 									launcher(backendEnv("vm-firecracker")...),
 									launcher(backendEnv("vm-firecracker")...),
+								))
+							})
+
+							It("folds the second one as a sidecar", func() {
+								runReq, err := sidecarRequest()
+								Expect(err).NotTo(HaveOccurred())
+								codependent := models.UnwrapAction(runReq.RunInfo.Action).(*models.CodependentAction)
+								Expect(codependent.Actions).To(HaveLen(2))
+								relay := models.UnwrapAction(codependent.Actions[1]).(*models.RunAction)
+								Expect(relay.Env[0].Name).To(Equal("CF_VM_SIDECAR_RELAY"))
+							})
+						})
+
+						Context("when a launcher process is nested in a wrapper of the action", func() {
+							BeforeEach(func() {
+								desiredLRP.Action = wrap(models.Codependent(
+									launcher(backendEnv("vm-firecracker")...),
+									models.Serial(launcher(backendEnv("vm-firecracker")...)),
 								))
 							})
 
@@ -987,9 +1020,11 @@ var _ = Describe("Resources", func() {
 								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher())}}
 							})
 
-							It("fails the conversion", func() {
-								_, err := sidecarRequest()
-								Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
+							It("folds the sidecar", func() {
+								runReq, err := sidecarRequest()
+								Expect(err).NotTo(HaveOccurred())
+								Expect(runReq.RunInfo.ExecutionBackend).To(Equal("vm-qemu"))
+								Expect(runReq.RunInfo.Sidecars).To(HaveLen(1))
 							})
 						})
 
@@ -999,10 +1034,9 @@ var _ = Describe("Resources", func() {
 								desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(&models.RunAction{Path: "/tmp/other"})}}
 							})
 
-							It("selects the backend", func() {
-								runReq, err := sidecarRequest()
-								Expect(err).NotTo(HaveOccurred())
-								Expect(runReq.RunInfo.ExecutionBackend).To(Equal("vm-qemu"))
+							It("fails the conversion", func() {
+								_, err := sidecarRequest()
+								Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
 							})
 						})
 
@@ -1063,8 +1097,8 @@ var _ = Describe("Resources", func() {
 							Entry("vm-qemu with a droplet layer escaping /home/vcap", "vm-qemu", "preloaded+layer:cflinuxfs3?layer=http://file-server/layer.tgz&layer_digest=some-digest&layer_path=/home/vcap/../../etc", true),
 							Entry("vm-qemu with a droplet layer and no layer_path", "vm-qemu", "preloaded+layer:cflinuxfs3?layer=http://file-server/layer.tgz&layer_digest=some-digest", true),
 							Entry("vm-firecracker with a preloaded stack", "vm-firecracker", "preloaded:cflinuxfs3", false),
-							Entry("vm-qemu with a docker image", "vm-qemu", "docker:///cloudfoundry/test", true),
-							Entry("vm-firecracker with a docker image", "vm-firecracker", "docker://registry.example.com/cloudfoundry/test", true),
+							Entry("vm-qemu with a docker image", "vm-qemu", "docker:///cloudfoundry/test", false),
+							Entry("vm-firecracker with a docker image", "vm-firecracker", "docker://registry.example.com/cloudfoundry/test", false),
 							Entry("vm-qemu with an unknown scheme", "vm-qemu", "oci:///some/image", true),
 							Entry("vm-qemu with no rootfs", "vm-qemu", "", true),
 							Entry("oci-gvisor with a docker image", "oci-gvisor", "docker:///cloudfoundry/test", false),
@@ -1072,11 +1106,11 @@ var _ = Describe("Resources", func() {
 						)
 
 						It("names the scheme and never the rootfs URL", func() {
-							desiredLRP.RootFs = "docker://some-user:some-secret@registry.example.com/cloudfoundry/test"
+							desiredLRP.RootFs = "oci://some-user:some-secret@registry.example.com/cloudfoundry/test"
 							desiredLRP.Action = wrap(launcher(backendEnv("vm-qemu")...))
 
 							_, err := rootFSRequest()
-							Expect(err).To(MatchError(ContainSubstring(`rootfs scheme "docker"`)))
+							Expect(err).To(MatchError(ContainSubstring(`rootfs scheme "oci"`)))
 							Expect(err.Error()).NotTo(ContainSubstring("some-secret"))
 							Expect(err.Error()).NotTo(ContainSubstring("registry.example.com"))
 						})
@@ -1100,9 +1134,9 @@ var _ = Describe("Resources", func() {
 						})
 
 						It("reports the sidecar limitation first when both apply", func() {
-							desiredLRP.RootFs = "docker:///cloudfoundry/test"
+							desiredLRP.RootFs = "oci:///some/image"
 							desiredLRP.Action = wrap(launcher(backendEnv("vm-qemu")...))
-							desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(launcher())}}
+							desiredLRP.Sidecars = []*models.Sidecar{{Action: wrap(&models.RunAction{Path: "/tmp/other"})}}
 
 							_, err := rootFSRequest()
 							Expect(err).To(MatchError(rep.ErrVMBackendSidecars))
@@ -1465,8 +1499,9 @@ var _ = Describe("Resources", func() {
 						},
 						Entry("vm-qemu with a preloaded stack", "vm-qemu", "preloaded:cflinuxfs3", false),
 						Entry("vm-firecracker with a preloaded stack and a layer", "vm-firecracker", "preloaded+layer:cflinuxfs3?layer=http://file-server/layer.tgz&layer_digest=some-digest&layer_path=/home/vcap", false),
-						Entry("vm-qemu with a docker image", "vm-qemu", "docker:///cloudfoundry/test", true),
-						Entry("vm-firecracker with a docker image", "vm-firecracker", "docker:///cloudfoundry/test", true),
+						Entry("vm-qemu with a docker image", "vm-qemu", "docker:///cloudfoundry/test", false),
+						Entry("vm-firecracker with a docker image", "vm-firecracker", "docker:///cloudfoundry/test", false),
+						Entry("vm-qemu with an unknown scheme", "vm-qemu", "oci:///some/image", true),
 						Entry("vm-qemu with no rootfs", "vm-qemu", "", true),
 						Entry("oci-gvisor with a docker image", "oci-gvisor", "docker:///cloudfoundry/test", false),
 						Entry("no backend with a docker image", "", "docker:///cloudfoundry/test", false),

@@ -57,7 +57,7 @@ var _ = Describe("EvacuationLrpProcessor", func() {
 
 			fakeMetronClient = new(mfakes.FakeIngressClient)
 
-			lrpProcessor = internal.NewLRPProcessor(fakeBBS, fakeContainerDelegate, fakeMetronClient, localCellID, localAvailabilityZone, rep.StackPathMap{}, "", fakeEvacuationReporter)
+			lrpProcessor = internal.NewLRPProcessor(fakeBBS, fakeContainerDelegate, fakeMetronClient, localCellID, localAvailabilityZone, rep.StackPathMap{}, "", fakeEvacuationReporter, nil)
 
 			processGuid = "process-guid"
 			desiredLRP = models.DesiredLRP{

@@ -54,6 +54,9 @@ properties:
   diego.auctioneer.starting_container_count_maximum:
     description: "Maximum number of inflight container starts allowed globally. Value of 0 or less indicates no limit."
     default: 0
+  diego.auctioneer.execution_backend_lookup_timeout:
+    description: "Longest time one auction round waits for BBS to say which execution backend its LRPs and tasks select. A workload whose lookup is not done by then waits for a later round."
+    default: "5s"
 
   diego.auctioneer.bbs.api_location:
     description: "Address to the BBS Server"

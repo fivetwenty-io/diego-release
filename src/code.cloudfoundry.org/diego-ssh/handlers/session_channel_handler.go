@@ -10,9 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"code.cloudfoundry.org/diego-ssh/helpers"
 	"code.cloudfoundry.org/diego-ssh/scp"
@@ -27,11 +29,17 @@ import (
 
 var scpRegex = regexp.MustCompile(`^\s*scp($|\s+)`)
 
+// guestSFTPServerCommand starts the guest's own sftp-server, from the first
+// of the places OpenSSH packages put it, and says why sftp cannot work when
+// the guest has none.
+const guestSFTPServerCommand = `for p in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/sftp-server /usr/lib/sftp-server; do if [ -x "$p" ]; then exec "$p"; fi; done; echo "sftp is not available, because this app's VM guest has no sftp-server" >&2; exit 127`
+
 type SessionChannelHandler struct {
 	runner       Runner
 	shellLocator ShellLocator
 	defaultEnv   map[string]string
 	keepalive    time.Duration
+	guestAgent   *GuestAgent
 }
 
 func NewSessionChannelHandler(
@@ -40,11 +48,27 @@ func NewSessionChannelHandler(
 	defaultEnv map[string]string,
 	keepalive time.Duration,
 ) *SessionChannelHandler {
+	return NewSessionChannelHandlerWithGuestAgent(runner, shellLocator, defaultEnv, keepalive, nil)
+}
+
+// NewSessionChannelHandlerWithGuestAgent returns a handler that runs scp and
+// sftp in the app's VM guest when guestAgent is ready, refuses them when it
+// is down, and runs them in sshd's own process when it is absent. A nil
+// guestAgent is always absent, which makes it the handler that
+// NewSessionChannelHandler returns.
+func NewSessionChannelHandlerWithGuestAgent(
+	runner Runner,
+	shellLocator ShellLocator,
+	defaultEnv map[string]string,
+	keepalive time.Duration,
+	guestAgent *GuestAgent,
+) *SessionChannelHandler {
 	return &SessionChannelHandler{
 		runner:       runner,
 		shellLocator: shellLocator,
 		defaultEnv:   defaultEnv,
 		keepalive:    keepalive,
+		guestAgent:   guestAgent,
 	}
 }
 
@@ -73,9 +97,10 @@ type session struct {
 	keepaliveDuration time.Duration
 	keepaliveStopCh   chan struct{}
 
-	shellPath string
-	runner    Runner
-	channel   ssh.Channel
+	shellPath  string
+	runner     Runner
+	channel    ssh.Channel
+	guestAgent *GuestAgent
 
 	sync.Mutex
 	env     map[string]string
@@ -95,6 +120,7 @@ func (handler *SessionChannelHandler) newSession(logger lager.Logger, channel ss
 		runner:            handler.runner,
 		shellPath:         handler.shellLocator.ShellPath(),
 		channel:           channel,
+		guestAgent:        handler.guestAgent,
 		env:               handler.defaultEnv,
 	}
 }
@@ -305,6 +331,15 @@ func (sess *session) handleExecRequest(request *ssh.Request) {
 	}
 
 	if scpRegex.MatchString(execMessage.Command) {
+		switch state, reason := sess.guestAgent.Check(); state {
+		case GuestAgentReady:
+			logger.Info("handling-scp-command-in-guest", lager.Data{"Command": execMessage.Command})
+			sess.executeTransferInGuest(request, "-c", execMessage.Command)
+			return
+		case GuestAgentDown:
+			sess.refuseTransfer(logger, request, "scp", reason)
+			return
+		}
 		logger.Info("handling-scp-command", lager.Data{"Command": execMessage.Command})
 		sess.executeSCP(execMessage.Command, request)
 	} else {
@@ -349,6 +384,16 @@ func (sess *session) handleSubsystemRequest(request *ssh.Request) {
 		return
 	}
 
+	switch state, reason := sess.guestAgent.Check(); state {
+	case GuestAgentReady:
+		logger.Info("starting-server-in-guest")
+		sess.executeTransferInGuest(request, "-c", guestSFTPServerCommand)
+		return
+	case GuestAgentDown:
+		sess.refuseTransfer(logger, request, "sftp", reason)
+		return
+	}
+
 	lagerWriter := helpers.NewLagerWriter(logger.Session("sftp-server"))
 	sftpServer, err := sftp.NewServer(sess.channel, sftp.WithDebug(lagerWriter))
 	if err != nil {
@@ -377,6 +422,48 @@ func (sess *session) handleSubsystemRequest(request *ssh.Request) {
 			logger.Error("sftp-serve-error", err)
 		}
 	}()
+}
+
+// executeTransferInGuest runs scp or sftp-server through the shell, which in
+// a VM container is the guest agent's shim, so that the transfer reads and
+// writes the guest's files. It never uses a terminal, which would change
+// the bytes, just as the in-process scp and sftp servers never do.
+func (sess *session) executeTransferInGuest(request *ssh.Request, args ...string) {
+	sess.Lock()
+	sess.allocPty = false
+	sess.Unlock()
+
+	sess.executeShell(request, args...)
+}
+
+// refuseTransfer ends an scp or sftp request while the agent of the app's VM
+// guest does not answer. The app's files are in the guest, so serving the
+// container's files would write where the app never reads. It accepts the
+// request, so that the client shows the reason it writes on the error
+// output, and ends with exit status 1.
+func (sess *session) refuseTransfer(logger lager.Logger, request *ssh.Request, transfer string, reason error) {
+	if reason == nil {
+		reason = errors.New("no reason given")
+	}
+	logger.Error("guest-agent-down", reason, lager.Data{"transfer": transfer})
+
+	if request.WantReply {
+		err := request.Reply(true, nil)
+		if err != nil {
+			logger.Debug("failed-to-reply", lager.Data{"error": err})
+		}
+	}
+
+	// The reason can carry text from the guest, so drop control characters.
+	printable := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, reason.Error())
+	_, _ = fmt.Fprintf(sess.channel.Stderr(), "%s is not available right now, because the guest agent of this app's VM is not answering (%s). Try again shortly.\n", transfer, printable)
+	sess.sendSCPExitMessage(reason)
+	sess.destroy()
 }
 
 func (sess *session) executeShell(request *ssh.Request, args ...string) {

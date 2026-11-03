@@ -31,6 +31,7 @@ type runStep struct {
 	gracefulShutdownInterval time.Duration
 	suppressExitStatusCode   bool
 	sidecar                  Sidecar
+	passStopGrace            bool
 }
 
 type Sidecar struct {
@@ -102,12 +103,26 @@ func NewRunWithSidecar(
 	}
 }
 
+// WithStopGrace makes the step pass its graceful shutdown interval to the
+// process, in whole seconds, as CF_VM_STOP_GRACE_SECONDS. The VM launcher sizes
+// its stop deadline from that value, so only steps for VM backends set it.
+func (step *runStep) WithStopGrace() *runStep {
+	step.passStopGrace = true
+	return step
+}
+
 func (step *runStep) Run(signals <-chan os.Signal, ready chan<- struct{}) error {
 	step.logger.Info("running")
 
 	envVars := convertEnvironmentVariables(step.model.Env)
 
 	envVars = append(envVars, step.networkingEnvVars()...)
+
+	if step.passStopGrace && step.gracefulShutdownInterval > 0 {
+		// A positive interval under one second still counts as one second.
+		seconds := max(1, int(step.gracefulShutdownInterval/time.Second))
+		envVars = append(envVars, fmt.Sprintf("%s=%d", executor.StopGraceSecondsEnvVar, seconds))
+	}
 
 	select {
 	case <-signals:

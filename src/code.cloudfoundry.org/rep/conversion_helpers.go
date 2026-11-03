@@ -41,13 +41,16 @@ var (
 	ErrIntergerOverflow     = errors.New("integer overflow")
 
 	// ErrVMBackendSidecars is returned when an LRP that selects a VM execution
-	// backend also runs more than one launcher process.
+	// backend has sidecars or launcher processes that foldVMSidecars cannot
+	// fold into the app's launcher process. The error names the rule that
+	// failed.
 	ErrVMBackendSidecars = errors.New("VM execution backends do not support sidecars")
 
 	// ErrVMBackendRootFS is returned when an LRP or Task that selects a VM
-	// execution backend does not use a preloaded rootfs, which is the only kind
-	// of image that an operator installs on the cell.
-	ErrVMBackendRootFS = errors.New("VM execution backends require a preloaded rootfs")
+	// execution backend uses neither a preloaded rootfs, which is the only kind
+	// of image that an operator installs on the cell, nor a Docker image, which
+	// Garden boots inside the guest.
+	ErrVMBackendRootFS = errors.New("VM execution backends require a preloaded rootfs or a Docker image")
 )
 
 func ActualLRPKeyFromTags(tags executor.Tags) (*models.ActualLRPKey, error) {
@@ -179,6 +182,12 @@ func ConvertPreloadedRootFS(rootFS string, imageLayers []*models.ImageLayer, lay
 
 type RunRequestConversionHelper struct {
 	ECRHelper ecrhelper.ECRHelper
+
+	// ExecutionBackendPolicy, when set, refuses a workload whose execution
+	// backend the cell does not offer or does not accept. Placement applies the
+	// same policy, so a refusal here means the workload reached the cell
+	// without it, for example through an auctioneer that predates the policy.
+	ExecutionBackendPolicy *ExecutionBackendPolicy
 }
 
 func (rrch RunRequestConversionHelper) NewRunRequestFromDesiredLRP(
@@ -226,6 +235,27 @@ func (rrch RunRequestConversionHelper) NewRunRequestFromDesiredLRP(
 	if err != nil {
 		return executor.RunRequest{}, err
 	}
+	if rrch.ExecutionBackendPolicy != nil {
+		if err := rrch.ExecutionBackendPolicy.Check(executionBackend, "", ""); err != nil {
+			return executor.RunRequest{}, err
+		}
+	}
+
+	// A VM backend boots one VM per launcher process, so the sidecars travel
+	// inside the app's launcher process, and what stays in the run request is
+	// only the relay that carries each sidecar's output.
+	action := desiredLRP.Action
+	var sidecars []executor.Sidecar
+	if isVMBackend(executionBackend) && (len(desiredLRP.Sidecars) > 0 || len(launcherRunActions(desiredLRP.Action)) > 1) {
+		var fieldSidecars []*models.Sidecar
+		action, fieldSidecars, err = foldVMSidecars(desiredLRP)
+		if err != nil {
+			return executor.RunRequest{}, err
+		}
+		sidecars = convertSidecars(fieldSidecars)
+	} else {
+		sidecars = convertSidecars(desiredLRP.Sidecars)
+	}
 
 	if err := checkVMBackendRootFS(executionBackend, desiredLRP.RootFs); err != nil {
 		return executor.RunRequest{}, err
@@ -252,7 +282,7 @@ func (rrch RunRequestConversionHelper) NewRunRequestFromDesiredLRP(
 		Privileged:         desiredLRP.Privileged,
 		CachedDependencies: ConvertCachedDependencies(desiredLRP.CachedDependencies),
 		Setup:              desiredLRP.Setup,
-		Action:             desiredLRP.Action,
+		Action:             action,
 		Monitor:            desiredLRP.Monitor,
 		CheckDefinition:    desiredLRP.CheckDefinition,
 		EgressRules:        desiredLRP.EgressRules,
@@ -269,7 +299,7 @@ func (rrch RunRequestConversionHelper) NewRunRequestFromDesiredLRP(
 		ImageUsername:                 username,
 		ImagePassword:                 password,
 		EnableContainerProxy:          true,
-		Sidecars:                      convertSidecars(desiredLRP.Sidecars),
+		Sidecars:                      sidecars,
 		LogRateLimitBytesPerSecond:    convertLogRateLimit(desiredLRP.LogRateLimit),
 		VolumeMountedFiles:            executor.VolumeMountedFilesFromModel(desiredLRP.VolumeMountedFiles),
 		ExecutionBackend:              executionBackend,
@@ -316,6 +346,11 @@ func (rrch RunRequestConversionHelper) NewRunRequestFromTask(task *models.Task, 
 	}
 
 	executionBackend := executionBackendFromEnv(task.EnvironmentVariables)
+	if rrch.ExecutionBackendPolicy != nil {
+		if err := rrch.ExecutionBackendPolicy.Check(executionBackend, task.Domain, AppExecutionBackendForTask(task)); err != nil {
+			return executor.RunRequest{}, err
+		}
+	}
 	if err := checkVMBackendRootFS(executionBackend, task.RootFs); err != nil {
 		return executor.RunRequest{}, err
 	}
@@ -364,9 +399,9 @@ const cfLauncherPath = "/tmp/lifecycle/launcher"
 // Cloud Controller puts the app environment, which carries the selector, in the
 // env of the RunAction that starts the app, so the action tree is searched
 // first. The LRP-level environment is the fallback for LRPs that were not built
-// by Cloud Controller. It returns ErrVMBackendSidecars when the backend is a VM
-// backend and the LRP runs more than one launcher process, because every
-// launcher process would boot its own VM on the same ports.
+// by Cloud Controller. Sidecars and extra launcher processes do not affect the
+// selection here, because foldVMSidecars decides whether a VM backend LRP can
+// carry them.
 func executionBackendFromLRP(desiredLRP *models.DesiredLRP) (string, error) {
 	launchers := launcherRunActions(desiredLRP.Action)
 	for _, sidecar := range desiredLRP.Sidecars {
@@ -387,18 +422,18 @@ func executionBackendFromLRP(desiredLRP *models.DesiredLRP) (string, error) {
 		backend, _ = lastEnvValue(desiredLRP.EnvironmentVariables, executor.ExecutionBackendEnvVar)
 	}
 
-	if isVMBackend(backend) && len(launchers) > 1 {
-		return "", fmt.Errorf("%w: backend %q, %d launcher processes", ErrVMBackendSidecars, backend, len(launchers))
-	}
 	return backend, nil
 }
 
 // checkVMBackendRootFS returns ErrVMBackendRootFS when the backend is a VM
-// backend and the rootfs is not one of the operator's preloaded stacks, either
-// bare or with an application layer whose layer_path, once cleaned, is
-// /home/vcap or below it. Docker images and every other scheme are
-// refused, because a VM backend runs its hypervisor inside the image's mount
-// namespace and only trusts an image that an operator installed. The rootfs is
+// backend and the rootfs is neither a Docker image nor one of the operator's
+// preloaded stacks, either bare or with an application layer whose layer_path,
+// once cleaned, is /home/vcap or below it. Every other scheme is refused,
+// because a VM backend runs its hypervisor inside the image's mount namespace
+// and only trusts an image that an operator installed. A Docker image is
+// accepted because Guardian never runs the hypervisor in it. Guardian boots the
+// image inside the guest and runs the hypervisor on the operator's rootfs, and
+// it refuses the image itself when the cell has no such rootfs. The rootfs is
 // the one after ConvertPreloadedRootFS, so a preloaded stack with a droplet
 // layer already has the preloaded+layer scheme. Guardian enforces the same rule
 // for the image it receives; this check surfaces it before the container exists.
@@ -410,7 +445,7 @@ func checkVMBackendRootFS(backend, rootFS string) error {
 	scheme := ""
 	if u, err := url.Parse(rootFS); err == nil {
 		scheme = u.Scheme
-		if scheme == models.PreloadedRootFSScheme {
+		if scheme == models.PreloadedRootFSScheme || scheme == dockerRootFSScheme {
 			return nil
 		}
 		if scheme == models.PreloadedOCIRootFSScheme {
@@ -422,6 +457,10 @@ func checkVMBackendRootFS(backend, rootFS string) error {
 	}
 	return fmt.Errorf("%w: backend %q, rootfs scheme %q", ErrVMBackendRootFS, backend, scheme)
 }
+
+// dockerRootFSScheme is the scheme Cloud Controller gives the rootfs of a
+// Docker image app.
+const dockerRootFSScheme = "docker"
 
 const vcapHome = "/home/vcap"
 
@@ -436,44 +475,46 @@ func underVCAPHome(layerPath string) bool {
 }
 
 // isVMBackend reports whether the backend name selects a VM execution backend.
-//
-// This is a copy of guardian's backend.IsVM, which the rep cannot import.
-// Change the two together. guardian's backend_test.go enumerates every known
-// kind through IsVM, so adding a kind there fails until it is classified, and
-// the "which backend names count as a VM" spec in conversion_helpers_test.go
-// pins this copy.
+// It delegates to the executor's copy of guardian's backend.IsVM, and the "which
+// backend names count as a VM" spec in conversion_helpers_test.go pins it.
 func isVMBackend(backend string) bool {
-	return backend == "vm-qemu" || backend == "vm-firecracker"
+	return executor.IsVMExecutionBackend(backend)
 }
 
 // launcherRunActions returns, in tree order, every RunAction under the action
 // whose path is the CF launcher. It descends through every wrapper action.
 func launcherRunActions(action *models.Action) []*models.RunAction {
+	return runActionsWithPath(action, cfLauncherPath)
+}
+
+// runActionsWithPath returns the run actions in an action tree whose path is
+// path, in tree order, or every run action when path is empty.
+func runActionsWithPath(action *models.Action, path string) []*models.RunAction {
 	switch a := models.UnwrapAction(action).(type) {
 	case *models.RunAction:
-		if a != nil && a.Path == cfLauncherPath {
+		if a != nil && (path == "" || a.Path == path) {
 			return []*models.RunAction{a}
 		}
 	case *models.TimeoutAction:
-		return launcherRunActions(a.Action)
+		return runActionsWithPath(a.Action, path)
 	case *models.TryAction:
-		return launcherRunActions(a.Action)
+		return runActionsWithPath(a.Action, path)
 	case *models.EmitProgressAction:
-		return launcherRunActions(a.Action)
+		return runActionsWithPath(a.Action, path)
 	case *models.SerialAction:
-		return launcherRunActionsOf(a.Actions)
+		return runActionsWithPathOf(a.Actions, path)
 	case *models.ParallelAction:
-		return launcherRunActionsOf(a.Actions)
+		return runActionsWithPathOf(a.Actions, path)
 	case *models.CodependentAction:
-		return launcherRunActionsOf(a.Actions)
+		return runActionsWithPathOf(a.Actions, path)
 	}
 	return nil
 }
 
-func launcherRunActionsOf(actions []*models.Action) []*models.RunAction {
+func runActionsWithPathOf(actions []*models.Action, path string) []*models.RunAction {
 	var runs []*models.RunAction
 	for _, action := range actions {
-		runs = append(runs, launcherRunActions(action)...)
+		runs = append(runs, runActionsWithPath(action, path)...)
 	}
 	return runs
 }
