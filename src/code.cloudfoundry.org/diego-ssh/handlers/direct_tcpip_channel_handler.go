@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"fmt"
-	"net"
 	"sync"
 
 	"code.cloudfoundry.org/diego-ssh/helpers"
@@ -79,7 +78,14 @@ func (handler *DirectTcpipChannelHandler) HandleNewChannel(logger lager.Logger, 
 	logger.Debug("copying-channel-data")
 	go helpers.CopyAndClose(logger.Session("to-target"), wg, conn, channel,
 		func() {
-			err := conn.(*net.TCPConn).CloseWrite()
+			// A TCP connection and a guest agent's Unix connection both
+			// half-close.
+			closeWriter, ok := conn.(interface{ CloseWrite() error })
+			if !ok {
+				logger.Debug("failed-to-close-connection", lager.Data{"error": "the connection cannot half-close"})
+				return
+			}
+			err := closeWriter.CloseWrite()
 			if err != nil {
 				logger.Debug("failed-to-close-connection", lager.Data{"error": err})
 			}
