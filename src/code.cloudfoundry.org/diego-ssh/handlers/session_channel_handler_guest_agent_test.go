@@ -345,12 +345,56 @@ exit 3
 	})
 
 	Context("when the relay says the guest's agent is down", func() {
+		var relay *fakeGuestAgentRelay
+
 		BeforeEach(func() {
-			relay := startFakeGuestAgentRelay(relayAnswers("down"), nil)
+			relay = startFakeGuestAgentRelay(relayAnswers("down"), nil)
 			agent = guestAgentAt(relay.path)
 		})
 
-		itServesTransfersInProcess()
+		// refused opens a session channel, sends request with payload, and
+		// returns what the channel wrote to standard error and its exit
+		// status.
+		refused := func(request string, payload []byte) (string, *ssh.Request) {
+			channel, requests, err := client.OpenChannel("session", nil)
+			Expect(err).NotTo(HaveOccurred())
+			defer channel.Close()
+			accepted, err := channel.SendRequest(request, true, payload)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(accepted).To(BeTrue())
+
+			stderr, err := io.ReadAll(channel.Stderr())
+			Expect(err).NotTo(HaveOccurred())
+			var exitStatus *ssh.Request
+			Eventually(requests).Should(Receive(&exitStatus))
+			return string(stderr), exitStatus
+		}
+
+		It("refuses scp with a clear reason and exit status 1, rather than serve the container's files", func() {
+			targetDir := GinkgoT().TempDir()
+			stderr, exitStatus := refused("exec", ssh.Marshal(struct{ Command string }{"scp -v -t " + targetDir}))
+			Expect(stderr).To(Equal("scp is not available right now, because the guest agent of this app's VM is not answering (the guest agent did not answer a ping: the agent is down). Try again shortly.\n"))
+			Expect(exitStatus.Type).To(Equal("exit-status"))
+			Expect(exitStatus.Payload).To(Equal(ssh.Marshal(struct{ Status uint32 }{1})))
+			Expect(os.ReadDir(targetDir)).To(BeEmpty())
+			Expect(runner.StartCallCount()).To(BeZero())
+			Expect(relay.Lines()).To(Equal([]string{"ping"}))
+		})
+
+		It("refuses sftp with a clear reason and exit status 1, rather than serve the container's files", func() {
+			stderr, exitStatus := refused("subsystem", ssh.Marshal(struct{ Subsystem string }{"sftp"}))
+			Expect(stderr).To(Equal("sftp is not available right now, because the guest agent of this app's VM is not answering (the guest agent did not answer a ping: the agent is down). Try again shortly.\n"))
+			Expect(exitStatus.Type).To(Equal("exit-status"))
+			Expect(exitStatus.Payload).To(Equal(ssh.Marshal(struct{ Status uint32 }{1})))
+			Expect(runner.StartCallCount()).To(BeZero())
+			Expect(argsFile).NotTo(BeAnExistingFile())
+		})
+
+		It("still runs other commands through the shell", func() {
+			output, err := newSession().Output("echo hello")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(output)).To(Equal("hello\n"))
+		})
 	})
 
 	Context("when there is no guest agent at all, as without -vmContainer", func() {

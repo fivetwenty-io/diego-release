@@ -50,9 +50,10 @@ func NewSessionChannelHandler(
 }
 
 // NewSessionChannelHandlerWithGuestAgent returns a handler that runs scp and
-// sftp in the app's VM guest when guestAgent is ready, and in sshd's own
-// process otherwise. A nil guestAgent is always absent, which makes it the
-// handler that NewSessionChannelHandler returns.
+// sftp in the app's VM guest when guestAgent is ready, refuses them when it
+// is down, and runs them in sshd's own process when it is absent. A nil
+// guestAgent is always absent, which makes it the handler that
+// NewSessionChannelHandler returns.
 func NewSessionChannelHandlerWithGuestAgent(
 	runner Runner,
 	shellLocator ShellLocator,
@@ -328,9 +329,13 @@ func (sess *session) handleExecRequest(request *ssh.Request) {
 	}
 
 	if scpRegex.MatchString(execMessage.Command) {
-		if state, _ := sess.guestAgent.Check(); state == GuestAgentReady {
+		switch state, reason := sess.guestAgent.Check(); state {
+		case GuestAgentReady:
 			logger.Info("handling-scp-command-in-guest", lager.Data{"Command": execMessage.Command})
 			sess.executeTransferInGuest(request, "-c", execMessage.Command)
+			return
+		case GuestAgentDown:
+			sess.refuseTransfer(logger, request, "scp", reason)
 			return
 		}
 		logger.Info("handling-scp-command", lager.Data{"Command": execMessage.Command})
@@ -377,9 +382,13 @@ func (sess *session) handleSubsystemRequest(request *ssh.Request) {
 		return
 	}
 
-	if state, _ := sess.guestAgent.Check(); state == GuestAgentReady {
+	switch state, reason := sess.guestAgent.Check(); state {
+	case GuestAgentReady:
 		logger.Info("starting-server-in-guest")
 		sess.executeTransferInGuest(request, "-c", guestSFTPServerCommand)
+		return
+	case GuestAgentDown:
+		sess.refuseTransfer(logger, request, "sftp", reason)
 		return
 	}
 
@@ -423,6 +432,29 @@ func (sess *session) executeTransferInGuest(request *ssh.Request, args ...string
 	sess.Unlock()
 
 	sess.executeShell(request, args...)
+}
+
+// refuseTransfer ends an scp or sftp request while the agent of the app's VM
+// guest does not answer. The app's files are in the guest, so serving the
+// container's files would write where the app never reads. It accepts the
+// request, so that the client shows the reason it writes on the error
+// output, and ends with exit status 1.
+func (sess *session) refuseTransfer(logger lager.Logger, request *ssh.Request, transfer string, reason error) {
+	if reason == nil {
+		reason = errors.New("no reason given")
+	}
+	logger.Error("guest-agent-down", reason, lager.Data{"transfer": transfer})
+
+	if request.WantReply {
+		err := request.Reply(true, nil)
+		if err != nil {
+			logger.Debug("failed-to-reply", lager.Data{"error": err})
+		}
+	}
+
+	_, _ = fmt.Fprintf(sess.channel.Stderr(), "%s is not available right now, because the guest agent of this app's VM is not answering (%v). Try again shortly.\n", transfer, reason)
+	sess.sendSCPExitMessage(reason)
+	sess.destroy()
 }
 
 func (sess *session) executeShell(request *ssh.Request, args ...string) {
