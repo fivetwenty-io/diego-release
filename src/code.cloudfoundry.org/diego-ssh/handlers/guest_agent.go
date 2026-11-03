@@ -73,9 +73,9 @@ const (
 // forwards through a VM guest's agent, because the app's files and ports
 // are in the guest rather than in the container.
 //
-// sshd builds one only when the executor has passed it -vmContainer, which
-// the executor adds to the SSH daemon's arguments in the main action of a VM
-// container and nowhere else. In such a container the app runs in the guest
+// sshd builds one only when the executor has marked the container with the
+// trailing vm-container argument, which the executor adds to the SSH
+// daemon's arguments in the main action of a VM container and nowhere else. In such a container the app runs in the guest
 // and only the platform runs in the container, so the relay socket is
 // vm-launch's. In a runC or gVisor container, any process of the app could
 // create a socket at GuestAgentSocketPath, which is why sshd never builds a

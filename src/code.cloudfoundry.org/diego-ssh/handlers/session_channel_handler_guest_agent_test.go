@@ -137,6 +137,24 @@ exit 3
 		return session
 	}
 
+	// refused opens a session channel, sends request with payload, and
+	// returns what the channel wrote to standard error and its exit
+	// status.
+	refused := func(request string, payload []byte) (string, *ssh.Request) {
+		channel, requests, err := client.OpenChannel("session", nil)
+		Expect(err).NotTo(HaveOccurred())
+		defer channel.Close()
+		accepted, err := channel.SendRequest(request, true, payload)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(accepted).To(BeTrue())
+
+		stderr, err := io.ReadAll(channel.Stderr())
+		Expect(err).NotTo(HaveOccurred())
+		var exitStatus *ssh.Request
+		Eventually(requests).Should(Receive(&exitStatus))
+		return string(stderr), exitStatus
+	}
+
 	// scpUpload sends contents as name to an scp sink, as an scp client
 	// does, and waits for each of the sink's confirmations.
 	scpUpload := func(stdin io.Writer, stdout io.Reader, name string, contents []byte) {
@@ -352,24 +370,6 @@ exit 3
 			agent = guestAgentAt(relay.path)
 		})
 
-		// refused opens a session channel, sends request with payload, and
-		// returns what the channel wrote to standard error and its exit
-		// status.
-		refused := func(request string, payload []byte) (string, *ssh.Request) {
-			channel, requests, err := client.OpenChannel("session", nil)
-			Expect(err).NotTo(HaveOccurred())
-			defer channel.Close()
-			accepted, err := channel.SendRequest(request, true, payload)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(accepted).To(BeTrue())
-
-			stderr, err := io.ReadAll(channel.Stderr())
-			Expect(err).NotTo(HaveOccurred())
-			var exitStatus *ssh.Request
-			Eventually(requests).Should(Receive(&exitStatus))
-			return string(stderr), exitStatus
-		}
-
 		It("refuses scp with a clear reason and exit status 1, rather than serve the container's files", func() {
 			targetDir := GinkgoT().TempDir()
 			stderr, exitStatus := refused("exec", ssh.Marshal(struct{ Command string }{"scp -v -t " + targetDir}))
@@ -397,7 +397,56 @@ exit 3
 		})
 	})
 
-	Context("when there is no guest agent at all, as without -vmContainer", func() {
+	Context("when the relay's reason for a down agent carries control characters", func() {
+		// reasonRelay answers a ping with an error that has reason as its
+		// reason, and every other line with ok.
+		reasonRelay := func(reason string) {
+			relay := startFakeGuestAgentRelay(func(line string) string {
+				if line == "ping" {
+					return "error: " + reason
+				}
+				return "ok"
+			}, nil)
+			agent = guestAgentAt(relay.path)
+		}
+
+		expectRefusal := func(stderr string, exitStatus *ssh.Request, shown string) {
+			Expect(stderr).To(Equal("scp is not available right now, because the guest agent of this app's VM is not answering (" + shown + "). Try again shortly.\n"))
+			Expect(exitStatus.Type).To(Equal("exit-status"))
+			Expect(exitStatus.Payload).To(Equal(ssh.Marshal(struct{ Status uint32 }{1})))
+			Expect(runner.StartCallCount()).To(BeZero())
+		}
+
+		Context("mixed with printable text", func() {
+			BeforeEach(func() {
+				reasonRelay("\x1b[31mred\x1b[0m\rline\x00end\x7f and \u0085next \u00e9")
+			})
+
+			It("drops the control characters and keeps the printable text", func() {
+				stderr, exitStatus := refused("exec", ssh.Marshal(struct{ Command string }{"scp -v -t " + GinkgoT().TempDir()}))
+				expectRefusal(stderr, exitStatus, "[31mred[0mlineend and next \u00e9")
+				Expect(stderr).NotTo(MatchRegexp(`[\x00-\x08\x0b-\x1f\x7f]`))
+			})
+
+			It("does the same for sftp", func() {
+				stderr, _ := refused("subsystem", ssh.Marshal(struct{ Subsystem string }{"sftp"}))
+				Expect(stderr).To(Equal("sftp is not available right now, because the guest agent of this app's VM is not answering ([31mred[0mlineend and next \u00e9). Try again shortly.\n"))
+			})
+		})
+
+		Context("and nothing else", func() {
+			BeforeEach(func() {
+				reasonRelay("\x1b\r\x00\x07")
+			})
+
+			It("still refuses with exit status 1 and a message with nothing in its parentheses", func() {
+				stderr, exitStatus := refused("exec", ssh.Marshal(struct{ Command string }{"scp -v -t " + GinkgoT().TempDir()}))
+				expectRefusal(stderr, exitStatus, "")
+			})
+		})
+	})
+
+	Context("when there is no guest agent at all, as without the vm-container marker", func() {
 		itServesTransfersInProcess()
 	})
 })

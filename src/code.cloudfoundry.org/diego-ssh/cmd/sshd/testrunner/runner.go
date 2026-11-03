@@ -19,6 +19,10 @@ type Args struct {
 	AllowUnauthenticatedClients bool
 	InheritDaemonEnv            bool
 	VMContainer                 bool
+
+	// ExtraArgs are appended after the flags and before the marker, which
+	// lets a spec send arguments the executor never would.
+	ExtraArgs []string
 }
 
 func (args Args) ArgSlice() []string {
@@ -33,6 +37,7 @@ func (args Args) ArgSlice() []string {
 		"-allowUnauthenticatedClients=" + strconv.FormatBool(args.AllowUnauthenticatedClients),
 		"-inheritDaemonEnv=" + strconv.FormatBool(args.InheritDaemonEnv),
 	}
+	argSlice = append(argSlice, args.ExtraArgs...)
 	// The executor appends the marker as a bare trailing word, and only in a
 	// VM container.
 	if args.VMContainer {

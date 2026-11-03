@@ -33,6 +33,7 @@ var _ = Describe("SSH daemon with a guest agent", func() {
 		relayLines []string
 
 		vmContainer bool
+		extraArgs   []string
 		echoAddress string
 	)
 
@@ -90,6 +91,7 @@ var _ = Describe("SSH daemon with a guest agent", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		vmContainer = false
+		extraArgs = nil
 
 		// echoAddress is a TCP port in the container, which a forward that
 		// sshd dials itself reaches.
@@ -117,6 +119,7 @@ var _ = Describe("SSH daemon with a guest agent", func() {
 			HostKey:       hostKeyPem,
 			AuthorizedKey: publicAuthorizedKey,
 			VMContainer:   vmContainer,
+			ExtraArgs:     extraArgs,
 		})
 		runner.Command.Dir = workDir
 		process = ginkgomon.Invoke(runner)
@@ -195,6 +198,44 @@ var _ = Describe("SSH daemon with a guest agent", func() {
 
 			expectEcho(echoAddress, "from the container")
 			Expect(lines()).To(BeEmpty())
+		})
+	})
+
+	Context("when another positional argument comes before the vm-container marker, so that two follow the flags", func() {
+		BeforeEach(func() {
+			startRelay()
+			vmContainer = true
+			extraArgs = []string{"extra"}
+		})
+
+		It("treats the session as outside a VM, serves scp and forwards itself, and never asks the socket", func() {
+			session, err := client.NewSession()
+			Expect(err).NotTo(HaveOccurred())
+			_, _ = session.CombinedOutput("scp -h")
+			session.Close()
+
+			expectEcho(echoAddress, "from the container")
+			Expect(lines()).To(BeEmpty())
+		})
+	})
+
+	Context("when the executor passes the bare -vmContainer flag, as an executor from before the marker did", func() {
+		BeforeEach(func() {
+			startRelay()
+			extraArgs = []string{"-vmContainer"}
+		})
+
+		// The flag is still defined, so the daemon starts and honors it,
+		// which marks the container as a VM container without the marker.
+		It("starts and sends scp and forwards through the guest agent", func() {
+			session, err := client.NewSession()
+			Expect(err).NotTo(HaveOccurred())
+			_, _ = session.CombinedOutput("scp -h")
+			session.Close()
+			Expect(lines()).To(Equal([]string{"ping"}))
+
+			expectEcho("127.0.0.1:8080", "through the guest")
+			Expect(lines()).To(Equal([]string{"ping", "forward 127.0.0.1 8080"}))
 		})
 	})
 })
