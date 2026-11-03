@@ -22,6 +22,16 @@ const (
 	// the graceful shutdown interval, in whole seconds, to the VM launcher so
 	// that it can size its stop deadline. Only VM backends receive it.
 	StopGraceSecondsEnvVar = "CF_VM_STOP_GRACE_SECONDS"
+	// SSHDPath is the SSH daemon that Cloud Controller runs beside the app.
+	SSHDPath = "/tmp/lifecycle/diego-sshd"
+	// SSHDVMContainerFlag tells diego-sshd that it runs in the container of a
+	// VM backend, where the app runs in the guest and only the platform runs
+	// in the container. The executor adds it to the SSH daemon's arguments
+	// in the main action of a VM container, and nowhere else. Cloud
+	// Controller builds those arguments itself, so no app setting reaches
+	// them, and the flag is how diego-sshd knows that it may trust the guest
+	// agent's relay socket.
+	SSHDVMContainerFlag = "-vmContainer"
 )
 
 // IsVMExecutionBackend reports whether the backend name selects a VM execution

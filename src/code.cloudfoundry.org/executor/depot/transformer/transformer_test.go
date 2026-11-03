@@ -271,6 +271,97 @@ var _ = Describe("Transformer", func() {
 			)
 		})
 
+		Describe("the SSH daemon's VM container flag", func() {
+			var (
+				argsLock sync.Mutex
+				args     map[string][][]string
+			)
+
+			sshdArgs := []string{"-address=0.0.0.0:2222", "-inheritDaemonEnv", "-logLevel=fatal"}
+			sshd := func() *models.RunAction {
+				return &models.RunAction{Path: executor.SSHDPath, Args: append([]string{}, sshdArgs...)}
+			}
+
+			argsOf := func(path string) [][]string {
+				argsLock.Lock()
+				defer argsLock.Unlock()
+				return append([][]string{}, args[path]...)
+			}
+
+			BeforeEach(func() {
+				argsLock.Lock()
+				args = map[string][][]string{}
+				argsLock.Unlock()
+
+				// Cloud Controller runs the SSH daemon beside the app in a
+				// codependent action.
+				container.Setup = nil
+				container.Monitor = nil
+				container.Action = models.WrapAction(models.Codependent(
+					&models.RunAction{Path: "/action/path", Args: []string{"app"}},
+					sshd(),
+				))
+
+				gardenContainer.RunStub = func(processSpec garden.ProcessSpec, processIO garden.ProcessIO) (garden.Process, error) {
+					argsLock.Lock()
+					args[processSpec.Path] = append(args[processSpec.Path], processSpec.Args)
+					argsLock.Unlock()
+					if processSpec.Path == "/setup/path" {
+						return &gardenfakes.FakeProcess{}, nil
+					}
+					return makeProcessWithSignal(make(chan int)), nil // block forever but handle signal
+				}
+			})
+
+			start := func() {
+				runner, _, err := optimusPrime.StepsRunner(logger, container, gardenContainer, logStreamer, cfg)
+				Expect(err).NotTo(HaveOccurred())
+				process := ifrit.Background(runner)
+				DeferCleanup(func() { ginkgomon.Interrupt(process) })
+			}
+
+			DescribeTable("on a VM backend",
+				func(backend string) {
+					container.ExecutionBackend = backend
+					start()
+					Eventually(func() int { return len(argsOf(executor.SSHDPath)) }).Should(Equal(1))
+					Eventually(func() int { return len(argsOf("/action/path")) }).Should(Equal(1))
+					Expect(argsOf(executor.SSHDPath)).To(Equal([][]string{append(append([]string{}, sshdArgs...), "-vmContainer")}))
+					Expect(argsOf("/action/path")).To(Equal([][]string{{"app"}}))
+					Expect(models.UnwrapAction(container.Action).(*models.CodependentAction).Actions[1].RunAction.Args).To(Equal(sshdArgs))
+				},
+				Entry("qemu", "vm-qemu"),
+				Entry("firecracker", "vm-firecracker"),
+			)
+
+			It("adds the flag to no run of the SSH daemon outside the main action of a VM container", func() {
+				container.ExecutionBackend = "vm-qemu"
+				container.Setup = &models.Action{RunAction: &models.RunAction{Path: "/setup/path"}}
+				container.Action = &models.Action{RunAction: &models.RunAction{Path: "/action/path", Args: []string{"app"}}}
+				container.Sidecars = []executor.Sidecar{{Action: models.WrapAction(sshd())}}
+				container.Monitor = models.WrapAction(sshd())
+				start()
+				// The monitor waits on the fake clock, so each poll advances it.
+				Eventually(func() int {
+					clock.Increment(100 * time.Millisecond)
+					return len(argsOf(executor.SSHDPath))
+				}).Should(Equal(2))
+				Expect(argsOf(executor.SSHDPath)).To(Equal([][]string{sshdArgs, sshdArgs}))
+			})
+
+			DescribeTable("on a container that is not on a VM backend",
+				func(backend string) {
+					container.ExecutionBackend = backend
+					start()
+					Eventually(func() int { return len(argsOf(executor.SSHDPath)) }).Should(Equal(1))
+					Expect(argsOf(executor.SSHDPath)).To(Equal([][]string{sshdArgs}))
+				},
+				Entry("no backend selected", ""),
+				Entry("oci-runc", "oci-runc"),
+				Entry("oci-gvisor", "oci-gvisor"),
+			)
+		})
+
 		Context("when there is no run action", func() {
 			BeforeEach(func() {
 				container.Action = nil

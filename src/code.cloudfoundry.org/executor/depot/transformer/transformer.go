@@ -72,7 +72,10 @@ type transformer struct {
 	postSetupHook []string
 	postSetupUser string
 
-	passStopGrace bool
+	// vmAction marks the copy of the transformer that builds the main action
+	// of a VM container. Its run steps pass the stop grace interval, and its
+	// runs of the SSH daemon get executor.SSHDVMContainerFlag.
+	vmAction bool
 }
 
 type Option func(*transformer)
@@ -172,9 +175,13 @@ func (t *transformer) stepFor(
 	a := action.GetValue()
 	switch actionModel := a.(type) {
 	case *models.RunAction:
+		model := *actionModel
+		if t.vmAction && model.Path == executor.SSHDPath {
+			model.Args = append(append([]string{}, model.Args...), executor.SSHDVMContainerFlag)
+		}
 		runStep := steps.NewRun(
 			container,
-			*actionModel,
+			model,
 			logStreamer.WithSource(actionModel.LogSource),
 			logger,
 			externalIP,
@@ -185,7 +192,7 @@ func (t *transformer) stepFor(
 			t.gracefulShutdownInterval,
 			suppressExitStatusCode,
 		)
-		if t.passStopGrace {
+		if t.vmAction {
 			runStep.WithStopGrace()
 		}
 		return runStep
@@ -447,13 +454,14 @@ func (t *transformer) StepsRunner(
 		return nil, nil, err
 	}
 
-	// Only the launcher reads the stop grace interval, so only the main action
-	// of a VM container passes it. The transformer is shared by every
-	// container, so the action gets its own copy that sets the flag.
+	// Only the launcher reads the stop grace interval, and only the SSH daemon
+	// beside it needs to know that it runs in a VM container, so only the main
+	// action of a VM container passes either. The transformer is shared by
+	// every container, so the action gets its own copy that sets the flag.
 	actionTransformer := t
 	if executor.IsVMExecutionBackend(container.ExecutionBackend) {
 		vmTransformer := *t
-		vmTransformer.passStopGrace = true
+		vmTransformer.vmAction = true
 		actionTransformer = &vmTransformer
 	}
 
