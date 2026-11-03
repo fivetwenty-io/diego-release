@@ -158,7 +158,9 @@ func runServer() error {
 
 	runner := handlers.NewCommandRunner()
 	shellLocator := handlers.NewShellLocator()
-	dialer := &net.Dialer{}
+	// In the container of an app that runs in a VM, a forward reaches the
+	// app's ports in the guest through the guest agent.
+	dialer := handlers.NewGuestAgentDialer(handlers.NewGuestAgent(handlers.GuestAgentSocketPath), &net.Dialer{})
 
 	sshDaemon := daemon.New(
 		logger,
