@@ -957,12 +957,14 @@ var _ = Describe("SessionChannelHandler", func() {
 			var (
 				channel  ssh.Channel
 				requests <-chan *ssh.Request
-				exitCh   chan *uint32
+				exitCh   chan []uint32
 			)
 
 			BeforeEach(func() {
 				type subsysMsg struct{ Subsystem string }
 
+				// The channel is opened directly because ssh.Session.Wait
+				// reports "session not started" after RequestSubsystem.
 				var err error
 				channel, requests, err = client.OpenChannel("session", nil)
 				Expect(err).NotTo(HaveOccurred())
@@ -971,24 +973,25 @@ var _ = Describe("SessionChannelHandler", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(accepted).To(BeTrue())
 
-				// The session records the exit status the server sends, or nil
-				// if the server closes the channel without sending one.
-				exitCh = make(chan *uint32, 1)
+				// This goroutine records every exit status the server sends,
+				// and fails the test if one asks for a reply.
+				exitCh = make(chan []uint32, 1)
 				go func() {
 					defer GinkgoRecover()
 
-					var status *uint32
+					var statuses []uint32
 					for req := range requests {
 						if req.Type == "exit-status" {
 							var msg struct{ Status uint32 }
 							Expect(ssh.Unmarshal(req.Payload, &msg)).To(Succeed())
-							status = &msg.Status
+							statuses = append(statuses, msg.Status)
+							Expect(req.WantReply).To(BeFalse())
 						}
 						if req.WantReply {
 							req.Reply(false, nil)
 						}
 					}
-					exitCh <- status
+					exitCh <- statuses
 				}()
 			})
 
@@ -996,29 +999,30 @@ var _ = Describe("SessionChannelHandler", func() {
 				channel.Close()
 			})
 
-			It("sends exit status 0 after the sftp client closes", func() {
+			It("sends exactly one exit status of 0 after the sftp client closes", func() {
 				sftpClient, err := sftp.NewClientPipe(channel, closeWriter{channel})
 				Expect(err).NotTo(HaveOccurred())
 
 				_, err = sftpClient.Getwd()
 				Expect(err).NotTo(HaveOccurred())
-				Expect(sftpClient.Close()).To(Succeed())
 
-				var status *uint32
-				Eventually(exitCh).Should(Receive(&status))
-				Expect(status).NotTo(BeNil())
-				Expect(*status).To(BeEquivalentTo(0))
+				closed := make(chan error, 1)
+				go func() { closed <- sftpClient.Close() }()
+				Eventually(closed).Should(Receive(BeNil()))
+
+				var statuses []uint32
+				Eventually(exitCh).Should(Receive(&statuses))
+				Expect(statuses).To(Equal([]uint32{0}))
 			})
 
-			It("sends exit status 1 when the sftp server fails", func() {
+			It("sends exactly one exit status of 1 when the sftp server rejects a packet length", func() {
 				By("sending a packet with a zero length, which the sftp server rejects")
 				_, err := channel.Write([]byte{0, 0, 0, 0})
 				Expect(err).NotTo(HaveOccurred())
 
-				var status *uint32
-				Eventually(exitCh).Should(Receive(&status))
-				Expect(status).NotTo(BeNil())
-				Expect(*status).To(BeEquivalentTo(1))
+				var statuses []uint32
+				Eventually(exitCh).Should(Receive(&statuses))
+				Expect(statuses).To(Equal([]uint32{1}))
 			})
 		})
 	})

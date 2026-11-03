@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -418,13 +417,11 @@ func (sess *session) handleSubsystemRequest(request *ssh.Request) {
 	logger.Info("starting-server")
 	go func() {
 		defer sess.destroy()
-		serveErr := sftpServer.Serve()
-		if serveErr != nil && !errors.Is(serveErr, io.EOF) {
-			logger.Error("sftp-serve-error", serveErr)
-		} else {
-			serveErr = nil
-		}
-		sess.sendSCPExitMessage(serveErr)
+		// Serve returns nil when the client ends the session cleanly. The
+		// status helper logs a failure once, so it is not logged here too.
+		// Some pkg/sftp errors close the channel before Serve returns, and
+		// no status can be sent after that.
+		sess.sendExitStatus(sftpServer.Serve())
 	}()
 }
 
@@ -466,7 +463,7 @@ func (sess *session) refuseTransfer(logger lager.Logger, request *ssh.Request, t
 		return r
 	}, reason.Error())
 	_, _ = fmt.Fprintf(sess.channel.Stderr(), "%s is not available right now, because the guest agent of this app's VM is not answering (%s). Try again shortly.\n", transfer, printable)
-	sess.sendSCPExitMessage(reason)
+	sess.sendExitStatus(reason)
 	sess.destroy()
 }
 
@@ -820,18 +817,18 @@ func (sess *session) executeSCP(command string, request *ssh.Request) {
 		err = copier.Copy()
 	}
 
-	sess.sendSCPExitMessage(err)
+	sess.sendExitStatus(err)
 	sess.destroy()
 }
 
-func (sess *session) sendSCPExitMessage(err error) {
-	logger := sess.logger.Session("send-scp-exit-message")
+func (sess *session) sendExitStatus(err error) {
+	logger := sess.logger.Session("send-exit-status")
 	logger.Info("started")
 	defer logger.Info("finished")
 
 	var exitMessage exitStatusMsg
 	if err != nil {
-		logger.Error("building-scp-exit-message-from-error", err)
+		logger.Error("building-exit-status-from-error", err)
 		exitMessage = exitStatusMsg{Status: 1}
 	}
 
