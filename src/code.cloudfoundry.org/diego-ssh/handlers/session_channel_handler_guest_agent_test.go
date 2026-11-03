@@ -161,7 +161,7 @@ exit 3
 	Context("when the guest agent is available", func() {
 		BeforeEach(func() {
 			relay := startFakeGuestAgentRelay(agentOn, nil)
-			agent = handlers.NewGuestAgent(relay.path)
+			agent = guestAgentAt(relay.path)
 		})
 
 		It("runs scp through the shell, which runs it in the guest, with its input, output, and exit status", func() {
@@ -329,18 +329,47 @@ exit 3
 
 	Context("when the container has no guest agent socket, as for an app that does not run in a VM", func() {
 		BeforeEach(func() {
-			agent = handlers.NewGuestAgent(filepath.Join(GinkgoT().TempDir(), "agent.sock"))
+			agent = guestAgentAt(filepath.Join(GinkgoT().TempDir(), "agent.sock"))
 		})
 
 		itServesTransfersInProcess()
 	})
 
+	Context("when a process of a runC or gVisor app answers ok at the socket, without the shell's mount", func() {
+		var relay *fakeGuestAgentRelay
+
+		BeforeEach(func() {
+			relay = startFakeGuestAgentRelay(agentOn, nil)
+			agent = handlers.NewGuestAgent(relay.path, writeMountInfo(false))
+		})
+
+		itServesTransfersInProcess()
+
+		It("never asks that process", func() {
+			sftpClient, err := sftp.NewClient(client)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = sftpClient.Getwd()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sftpClient.Close()).To(Succeed())
+			output, err := newSession().Output("scp -h")
+			Expect(err).To(HaveOccurred(), string(output))
+			Expect(relay.Lines()).To(BeEmpty())
+		})
+	})
+
 	Context("when the relay says the guest has no agent", func() {
 		BeforeEach(func() {
-			relay := startFakeGuestAgentRelay(func(string) string {
-				return "error: this guest has no agent for cf ssh, because it is a spec"
-			}, nil)
-			agent = handlers.NewGuestAgent(relay.path)
+			relay := startFakeGuestAgentRelay(relayAnswers("off"), nil)
+			agent = guestAgentAt(relay.path)
+		})
+
+		itServesTransfersInProcess()
+	})
+
+	Context("when the relay says the guest's agent is down", func() {
+		BeforeEach(func() {
+			relay := startFakeGuestAgentRelay(relayAnswers("down"), nil)
+			agent = guestAgentAt(relay.path)
 		})
 
 		itServesTransfersInProcess()

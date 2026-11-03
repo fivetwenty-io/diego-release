@@ -1,13 +1,17 @@
+//go:build !windows && !windows2012R2
+
 package handlers_test
 
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,7 +23,11 @@ import (
 
 // fakeGuestAgentRelay stands in for vm-launch's guest agent relay. It reads
 // each client's first line, records it, and writes the answer that answer
-// gives. After an ok, stream, when set, gets the client's connection.
+// gives. After an ok to any line but a ping, stream, when set, gets the
+// client's connection. Every other connection closes after the answer, as
+// the real relay's does. The contract spec checks it against
+// testdata/guest-agent-relay-contract.txt, which vm-launch's specs check
+// the real relay against.
 type fakeGuestAgentRelay struct {
 	path     string
 	listener net.Listener
@@ -32,6 +40,7 @@ type fakeGuestAgentRelay struct {
 }
 
 func startFakeGuestAgentRelay(answer func(line string) string, stream func(line string, conn net.Conn)) *fakeGuestAgentRelay {
+	// A short directory keeps the socket's path within the limit.
 	dir, err := os.MkdirTemp("", "relay")
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(os.RemoveAll, dir)
@@ -69,7 +78,7 @@ func (relay *fakeGuestAgentRelay) handle(conn net.Conn) {
 
 	answer := relay.answer(line)
 	_, err = io.WriteString(conn, answer+"\n")
-	if err != nil || answer != "ok" || relay.stream == nil {
+	if err != nil || answer != "ok" || line == "ping" || relay.stream == nil {
 		conn.Close()
 		return
 	}
@@ -98,25 +107,118 @@ func (conn *bufferedConn) CloseWrite() error {
 	return conn.Conn.(*net.UnixConn).CloseWrite()
 }
 
-// agentOn answers every line with ok, as a relay whose guest has an agent.
-func agentOn(string) string { return "ok" }
+// relayAnswers answers each line as vm-launch's relay does for a guest in
+// state, which is "agent" for a guest whose agent answers, "off" for one
+// without an agent, or "down" for one whose agent cannot be reached.
+func relayAnswers(state string) func(string) string {
+	return func(line string) string {
+		fields := strings.Fields(line)
+		switch {
+		case len(fields) == 1 && fields[0] == "session":
+		case len(fields) == 3 && fields[0] == "forward":
+			if _, err := strconv.Atoi(fields[2]); err != nil {
+				return fmt.Sprintf("error: %q is not a port", fields[2])
+			}
+		case len(fields) == 1 && fields[0] == "ping":
+		default:
+			return fmt.Sprintf(`error: the guest agent relay takes "session", "forward HOST PORT", or "ping", not %q`, line)
+		}
+		switch state {
+		case "off":
+			return "error: this guest has no agent for cf ssh, because it is a spec"
+		case "down":
+			if fields[0] == "ping" {
+				return "error: the guest agent did not answer a ping: the agent is down"
+			}
+			return "error: the guest agent did not answer within 42s: the agent is down"
+		}
+		return "ok"
+	}
+}
 
-var _ = Describe("GuestAgent", func() {
-	BeforeEach(func() {
-		if runtime.GOOS == "windows" {
-			Skip("the guest agent runs only on Linux cells")
+// agentOn answers as a relay whose guest's agent answers.
+var agentOn = relayAnswers("agent")
+
+// mountInfo is a container's mount table without the shell that Garden
+// binds for the guest agent, and shellMount is that mount's line.
+const (
+	mountInfo = `1205 1146 0:331 / / rw,relatime - overlay overlay rw,lowerdir=/var/vcap/data/grootfs/l
+1206 1205 0:333 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+1207 1205 0:334 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755
+1208 1205 8:1 /var/vcap/data/garden/vm-launch /opt/garden-vm/vm-launch ro,nosuid,nodev,relatime - ext4 /dev/sda1 rw
+1209 1205 8:1 /var/vcap/data/garden/artifacts/bin/bash /opt/bin\040bash ro,nosuid,nodev,relatime - ext4 /dev/sda1 rw
+`
+	shellMount = `1210 1205 8:1 /var/vcap/data/garden/vm-launch /bin/bash ro,nosuid,nodev,relatime - ext4 /dev/sda1 rw
+`
+)
+
+// writeMountInfo writes a mount table, with the shell's mount when
+// shellBound is set, and returns its path.
+func writeMountInfo(shellBound bool) string {
+	contents := mountInfo
+	if shellBound {
+		contents += shellMount
+	}
+	path := filepath.Join(GinkgoT().TempDir(), "mountinfo")
+	Expect(os.WriteFile(path, []byte(contents), 0600)).To(Succeed())
+	return path
+}
+
+// guestAgentAt returns the gate for the relay at socketPath in a container
+// whose mount table shows the shell that Garden binds for the agent.
+func guestAgentAt(socketPath string) *handlers.GuestAgent {
+	return handlers.NewGuestAgent(socketPath, writeMountInfo(true))
+}
+
+// stalledRelay listens at a socket and never answers, and returns the
+// socket's path.
+func stalledRelay() string {
+	dir, err := os.MkdirTemp("", "relay")
+	Expect(err).NotTo(HaveOccurred())
+	DeferCleanup(os.RemoveAll, dir)
+	path := filepath.Join(dir, "agent.sock")
+	listener, err := net.Listen("unix", path)
+	Expect(err).NotTo(HaveOccurred())
+	var mu sync.Mutex
+	var conns []net.Conn
+	DeferCleanup(func() {
+		listener.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			conn.Close()
 		}
 	})
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	return path
+}
 
+var _ = Describe("GuestAgent", func() {
 	It("is not available without a socket, as in the container of an app that does not run in a VM", func() {
-		agent := handlers.NewGuestAgent(filepath.Join(GinkgoT().TempDir(), "agent.sock"))
+		agent := guestAgentAt(filepath.Join(GinkgoT().TempDir(), "agent.sock"))
 		Expect(agent.Available()).To(BeFalse())
 	})
 
-	It("is not available when the path is not a socket", func() {
+	It("is not available when the path is not a socket, or is a link to one", func() {
 		path := filepath.Join(GinkgoT().TempDir(), "agent.sock")
 		Expect(os.WriteFile(path, nil, 0600)).To(Succeed())
-		Expect(handlers.NewGuestAgent(path).Available()).To(BeFalse())
+		Expect(guestAgentAt(path).Available()).To(BeFalse())
+
+		relay := startFakeGuestAgentRelay(agentOn, nil)
+		link := filepath.Join(GinkgoT().TempDir(), "agent.sock")
+		Expect(os.Symlink(relay.path, link)).To(Succeed())
+		Expect(guestAgentAt(link).Available()).To(BeFalse())
+		Expect(relay.Lines()).To(BeEmpty())
 	})
 
 	It("is never available when nil", func() {
@@ -124,22 +226,53 @@ var _ = Describe("GuestAgent", func() {
 		Expect(agent.Available()).To(BeFalse())
 	})
 
-	It("is not available when the relay says the guest has no agent", func() {
-		relay := startFakeGuestAgentRelay(func(string) string {
-			return "error: this guest has no agent for cf ssh, because it is a spec"
-		}, nil)
-		Expect(handlers.NewGuestAgent(relay.path).Available()).To(BeFalse())
-		Expect(relay.Lines()).To(Equal([]string{"ping"}))
+	Context("when a process of the app answers ok at the socket, as one in a runC or gVisor container can", func() {
+		var relay *fakeGuestAgentRelay
+
+		BeforeEach(func() {
+			relay = startFakeGuestAgentRelay(agentOn, nil)
+		})
+
+		It("is not available, and never asks the socket, while sshd's mount table does not show the shell's mount", func() {
+			agent := handlers.NewGuestAgent(relay.path, writeMountInfo(false))
+			Expect(agent.Available()).To(BeFalse())
+			Expect(agent.Available()).To(BeFalse())
+			Expect(relay.Lines()).To(BeEmpty())
+		})
+
+		It("is not available when the mount table cannot be read", func() {
+			agent := handlers.NewGuestAgent(relay.path, filepath.Join(GinkgoT().TempDir(), "mountinfo"))
+			Expect(agent.Available()).To(BeFalse())
+			Expect(relay.Lines()).To(BeEmpty())
+		})
+
+		It("is not available when /bin/bash is only the root of a mount, or a mount point's prefix", func() {
+			path := filepath.Join(GinkgoT().TempDir(), "mountinfo")
+			Expect(os.WriteFile(path, []byte(mountInfo+
+				"1211 1205 8:1 /bin/bash /opt/shell ro - ext4 /dev/sda1 rw\n"+
+				"1212 1205 8:1 /x /bin/bashful ro - ext4 /dev/sda1 rw\n"+
+				"1213 1205 8:1 /x /bin/bash/x ro - ext4 /dev/sda1 rw\n"), 0600)).To(Succeed())
+			Expect(handlers.NewGuestAgent(relay.path, path).Available()).To(BeFalse())
+			Expect(relay.Lines()).To(BeEmpty())
+		})
+	})
+
+	It("is not available when the relay says the guest has no agent, or that its agent is down", func() {
+		for _, state := range []string{"off", "down"} {
+			relay := startFakeGuestAgentRelay(relayAnswers(state), nil)
+			Expect(guestAgentAt(relay.path).Available()).To(BeFalse())
+			Expect(relay.Lines()).To(Equal([]string{"ping"}))
+		}
 	})
 
 	It("is not available when the relay does not know the ping, as an older vm-launch's does not", func() {
 		relay := startFakeGuestAgentRelay(func(line string) string {
 			return `error: the guest agent relay takes "session" or "forward HOST PORT", not "` + line + `"`
 		}, nil)
-		Expect(handlers.NewGuestAgent(relay.path).Available()).To(BeFalse())
+		Expect(guestAgentAt(relay.path).Available()).To(BeFalse())
 	})
 
-	It("is not available when the relay closes without an answer, or answers too slowly", func() {
+	It("is not available when the relay closes without an answer", func() {
 		dir, err := os.MkdirTemp("", "relay")
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(os.RemoveAll, dir)
@@ -147,36 +280,71 @@ var _ = Describe("GuestAgent", func() {
 		listener, err := net.Listen("unix", path)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(listener.Close)
-		conns := make(chan net.Conn, 2)
 		go func() {
 			for {
 				conn, err := listener.Accept()
 				if err != nil {
 					return
 				}
-				conns <- conn
+				conn.Close()
 			}
 		}()
-
-		agent := handlers.NewGuestAgent(path)
-		go func() {
-			conn := <-conns
-			conn.Close()
-		}()
-		Expect(agent.Available()).To(BeFalse())
-
-		start := time.Now()
-		Expect(agent.Available()).To(BeFalse())
-		Expect(time.Since(start)).To(BeNumerically("<", 5*time.Second))
-		(<-conns).Close()
+		Expect(guestAgentAt(path).Available()).To(BeFalse())
 	})
 
-	It("is available once the relay answers the ping with ok, and does not ask again", func() {
+	It("gives up on a relay that does not answer within one timeout of four seconds, for the dial and the answer together", func() {
+		agent := guestAgentAt(stalledRelay())
+		start := time.Now()
+		Expect(agent.Available()).To(BeFalse())
+		Expect(time.Since(start)).To(BeNumerically("~", 4*time.Second, 750*time.Millisecond))
+	})
+
+	It("is available once the relay answers the ping with ok, and does not ask again for ten seconds", func() {
 		relay := startFakeGuestAgentRelay(agentOn, nil)
-		agent := handlers.NewGuestAgent(relay.path)
+		agent := guestAgentAt(relay.path)
+		now := time.Now()
+		var mu sync.Mutex
+		handlers.SetGuestAgentClock(agent, func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			return now
+		})
+		advance := func(d time.Duration) {
+			mu.Lock()
+			defer mu.Unlock()
+			now = now.Add(d)
+		}
+
 		Expect(agent.Available()).To(BeTrue())
+		advance(9 * time.Second)
 		Expect(agent.Available()).To(BeTrue())
 		Expect(relay.Lines()).To(Equal([]string{"ping"}))
+
+		advance(2 * time.Second)
+		Expect(agent.Available()).To(BeTrue())
+		Expect(relay.Lines()).To(Equal([]string{"ping", "ping"}))
+	})
+
+	It("is no longer available once the ok has lapsed and the relay says the agent is down", func() {
+		var mu sync.Mutex
+		state := "agent"
+		relay := startFakeGuestAgentRelay(func(line string) string {
+			mu.Lock()
+			defer mu.Unlock()
+			return relayAnswers(state)(line)
+		}, nil)
+		agent := guestAgentAt(relay.path)
+		now := time.Now()
+		handlers.SetGuestAgentClock(agent, func() time.Time { return now })
+
+		Expect(agent.Available()).To(BeTrue())
+		mu.Lock()
+		state = "down"
+		mu.Unlock()
+		Expect(agent.Available()).To(BeTrue())
+		now = now.Add(11 * time.Second)
+		Expect(agent.Available()).To(BeFalse())
+		Expect(relay.Lines()).To(Equal([]string{"ping", "ping"}))
 	})
 
 	It("asks again after an answer other than ok, because the relay may still be starting", func() {
@@ -190,7 +358,7 @@ var _ = Describe("GuestAgent", func() {
 			}
 			return "error: not yet"
 		}, nil)
-		agent := handlers.NewGuestAgent(relay.path)
+		agent := guestAgentAt(relay.path)
 		Expect(agent.Available()).To(BeFalse())
 		mu.Lock()
 		on = true
@@ -205,7 +373,7 @@ var _ = Describe("GuestAgent", func() {
 				defer conn.Close()
 				_, _ = io.WriteString(conn, "from the guest")
 			})
-			conn, err := handlers.NewGuestAgent(relay.path).Forward("localhost", 8080)
+			conn, err := guestAgentAt(relay.path).Forward("localhost", 8080)
 			Expect(err).NotTo(HaveOccurred())
 			defer conn.Close()
 			Expect(io.ReadAll(conn)).To(Equal([]byte("from the guest")))
@@ -214,24 +382,31 @@ var _ = Describe("GuestAgent", func() {
 
 		It("connects to the guest's own address when the host is empty", func() {
 			relay := startFakeGuestAgentRelay(agentOn, func(line string, conn net.Conn) { conn.Close() })
-			conn, err := handlers.NewGuestAgent(relay.path).Forward("", 8080)
+			conn, err := guestAgentAt(relay.path).Forward("", 8080)
 			Expect(err).NotTo(HaveOccurred())
 			conn.Close()
 			Expect(relay.Lines()).To(Equal([]string{"forward 127.0.0.1 8080"}))
 		})
 
-		It("returns the relay's reason when the forward cannot connect", func() {
-			relay := startFakeGuestAgentRelay(func(string) string {
-				return "error: connecting to 127.0.0.1 port 9 in the guest: connection refused"
+		It("returns the relay's reason when the forward cannot connect, and pings again before the next one", func() {
+			relay := startFakeGuestAgentRelay(func(line string) string {
+				if line == "forward 127.0.0.1 9" {
+					return "error: connecting to 127.0.0.1 port 9 in the guest: connection refused"
+				}
+				return "ok"
 			}, nil)
-			_, err := handlers.NewGuestAgent(relay.path).Forward("127.0.0.1", 9)
+			agent := guestAgentAt(relay.path)
+			Expect(agent.Available()).To(BeTrue())
+			_, err := agent.Forward("127.0.0.1", 9)
 			Expect(err).To(MatchError("connecting to 127.0.0.1 port 9 in the guest: connection refused"))
+			Expect(agent.Available()).To(BeTrue())
+			Expect(relay.Lines()).To(Equal([]string{"ping", "forward 127.0.0.1 9", "ping"}))
 		})
 
 		It("refuses a host that would not be one field of the relay's line, and a port that is not a TCP port, without asking the relay", func() {
 			relay := startFakeGuestAgentRelay(agentOn, nil)
-			agent := handlers.NewGuestAgent(relay.path)
-			for _, host := range []string{"localhost 80\nforward evil", "local\thost", "local\u00a0host", "local\x00host"} {
+			agent := guestAgentAt(relay.path)
+			for _, host := range []string{"localhost 80\nforward evil", "local\thost", "local host", "local\x00host"} {
 				_, err := agent.Forward(host, 8080)
 				Expect(err).To(MatchError(ContainSubstring("is not a host name or address")))
 			}
@@ -252,7 +427,7 @@ var _ = Describe("GuestAgent", func() {
 		})
 
 		It("dials with the fallback dialer, unchanged, when the guest agent is not available", func() {
-			dialer := handlers.NewGuestAgentDialer(handlers.NewGuestAgent(filepath.Join(GinkgoT().TempDir(), "agent.sock")), fallback)
+			dialer := handlers.NewGuestAgentDialer(guestAgentAt(filepath.Join(GinkgoT().TempDir(), "agent.sock")), fallback)
 			_, err := dialer.Dial("tcp", "10.0.0.1:8080")
 			Expect(err).To(MatchError("the fallback dialer"))
 			Expect(fallback.DialCallCount()).To(Equal(1))
@@ -261,9 +436,18 @@ var _ = Describe("GuestAgent", func() {
 			Expect(addr).To(Equal("10.0.0.1:8080"))
 		})
 
+		It("dials with the fallback dialer when an app's own socket answers ok without the shell's mount", func() {
+			relay := startFakeGuestAgentRelay(agentOn, func(line string, conn net.Conn) { conn.Close() })
+			dialer := handlers.NewGuestAgentDialer(handlers.NewGuestAgent(relay.path, writeMountInfo(false)), fallback)
+			_, err := dialer.Dial("tcp", "prod-db.internal:5432")
+			Expect(err).To(MatchError("the fallback dialer"))
+			Expect(fallback.DialCallCount()).To(Equal(1))
+			Expect(relay.Lines()).To(BeEmpty())
+		})
+
 		It("forwards through the guest agent when it is available, with the host and port of the address", func() {
 			relay := startFakeGuestAgentRelay(agentOn, func(line string, conn net.Conn) { conn.Close() })
-			dialer := handlers.NewGuestAgentDialer(handlers.NewGuestAgent(relay.path), fallback)
+			dialer := handlers.NewGuestAgentDialer(guestAgentAt(relay.path), fallback)
 			for _, addr := range []string{"localhost:8080", "::1:8081", "[::1]:8082"} {
 				conn, err := dialer.Dial("tcp", addr)
 				Expect(err).NotTo(HaveOccurred())
@@ -275,11 +459,110 @@ var _ = Describe("GuestAgent", func() {
 
 		It("refuses an address without a port", func() {
 			relay := startFakeGuestAgentRelay(agentOn, nil)
-			dialer := handlers.NewGuestAgentDialer(handlers.NewGuestAgent(relay.path), fallback)
+			dialer := handlers.NewGuestAgentDialer(guestAgentAt(relay.path), fallback)
 			_, err := dialer.Dial("tcp", "localhost")
 			Expect(err).To(MatchError(`the target address "localhost" has no port`))
 			_, err = dialer.Dial("tcp", "localhost:http")
 			Expect(err).To(MatchError(`the target address "localhost:http" has no port`))
 		})
+
+		It("keeps the guest's reason when a forward fails and the agent still answers", func() {
+			relay := startFakeGuestAgentRelay(func(line string) string {
+				if line == "ping" {
+					return "ok"
+				}
+				return "error: connecting to 127.0.0.1 port 9 in the guest: connection refused"
+			}, nil)
+			dialer := handlers.NewGuestAgentDialer(guestAgentAt(relay.path), fallback)
+			_, err := dialer.Dial("tcp", "127.0.0.1:9")
+			Expect(err).To(MatchError("connecting to 127.0.0.1 port 9 in the guest: connection refused"))
+			Expect(fallback.DialCallCount()).To(BeZero())
+			Expect(relay.Lines()).To(Equal([]string{"ping", "forward 127.0.0.1 9", "ping"}))
+		})
+
+		It("dials with the fallback dialer when a forward fails because the agent has gone down", func() {
+			var mu sync.Mutex
+			state := "agent"
+			relay := startFakeGuestAgentRelay(func(line string) string {
+				mu.Lock()
+				defer mu.Unlock()
+				answer := relayAnswers(state)(line)
+				if line == "ping" {
+					// The agent goes down just after it answers.
+					state = "down"
+				}
+				return answer
+			}, nil)
+			dialer := handlers.NewGuestAgentDialer(guestAgentAt(relay.path), fallback)
+			_, err := dialer.Dial("tcp", "127.0.0.1:8080")
+			Expect(err).To(MatchError("the fallback dialer"))
+			Expect(fallback.DialCallCount()).To(Equal(1))
+			_, addr := fallback.DialArgsForCall(0)
+			Expect(addr).To(Equal("127.0.0.1:8080"))
+			Expect(relay.Lines()).To(Equal([]string{"ping", "forward 127.0.0.1 8080", "ping"}))
+
+			_, err = dialer.Dial("tcp", "127.0.0.1:8080")
+			Expect(err).To(MatchError("the fallback dialer"))
+			Expect(fallback.DialCallCount()).To(Equal(2))
+			Expect(relay.Lines()).To(Equal([]string{"ping", "forward 127.0.0.1 8080", "ping", "ping"}))
+		})
+	})
+
+	It("has a fake relay that keeps the contract of vm-launch's relay", func() {
+		data, err := os.ReadFile(filepath.Join("testdata", "guest-agent-relay-contract.txt"))
+		Expect(err).NotTo(HaveOccurred())
+		echo := func(line string, conn net.Conn) {
+			defer conn.Close()
+			_, _ = io.Copy(conn, conn)
+			_ = conn.(interface{ CloseWrite() error }).CloseWrite()
+		}
+		relays := map[string]*fakeGuestAgentRelay{}
+		for _, state := range []string{"agent", "off", "down"} {
+			relays[state] = startFakeGuestAgentRelay(relayAnswers(state), echo)
+		}
+
+		cases := 0
+		for _, text := range strings.Split(string(data), "\n") {
+			if text == "" || strings.HasPrefix(text, "#") {
+				continue
+			}
+			fields := strings.Split(text, " | ")
+			Expect(fields).To(HaveLen(4), text)
+			state, line, want, after := fields[0], strings.ReplaceAll(fields[1], "PORT", "8080"), fields[2], fields[3]
+			Expect(relays).To(HaveKey(state), text)
+
+			conn, err := net.Dial("unix", relays[state].path)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(conn.SetDeadline(time.Now().Add(10 * time.Second))).To(Succeed())
+			_, err = io.WriteString(conn, line+"\n")
+			Expect(err).NotTo(HaveOccurred())
+			reader := bufio.NewReader(conn)
+			answer, err := reader.ReadString('\n')
+			Expect(err).NotTo(HaveOccurred())
+			answer = strings.TrimSuffix(answer, "\n")
+			switch want {
+			case "ok":
+				Expect(answer).To(Equal("ok"), text)
+			case "error:":
+				Expect(answer).To(MatchRegexp(`^error: \S`), text)
+			default:
+				Fail("the contract has no answer " + want)
+			}
+			switch after {
+			case "eof":
+				_, err := reader.ReadByte()
+				Expect(err).To(MatchError(io.EOF), text)
+			case "stream":
+				_, err := io.WriteString(conn, "through the guest")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(conn.(*net.UnixConn).CloseWrite()).To(Succeed())
+				Expect(io.ReadAll(reader)).To(Equal([]byte("through the guest")), text)
+			default:
+				Fail("the contract has no after " + after)
+			}
+			conn.Close()
+			cases++
+		}
+		Expect(cases).To(Equal(8))
 	})
 })

@@ -46,12 +46,13 @@ func NewSessionChannelHandler(
 	defaultEnv map[string]string,
 	keepalive time.Duration,
 ) *SessionChannelHandler {
-	return NewSessionChannelHandlerWithGuestAgent(runner, shellLocator, defaultEnv, keepalive, NewGuestAgent(GuestAgentSocketPath))
+	return NewSessionChannelHandlerWithGuestAgent(runner, shellLocator, defaultEnv, keepalive, nil)
 }
 
 // NewSessionChannelHandlerWithGuestAgent returns a handler that runs scp and
 // sftp in the app's VM guest when guestAgent is available, and in sshd's own
-// process otherwise. A nil guestAgent is never available.
+// process otherwise. A nil guestAgent is never available, which makes it
+// the handler that NewSessionChannelHandler returns.
 func NewSessionChannelHandlerWithGuestAgent(
 	runner Runner,
 	shellLocator ShellLocator,

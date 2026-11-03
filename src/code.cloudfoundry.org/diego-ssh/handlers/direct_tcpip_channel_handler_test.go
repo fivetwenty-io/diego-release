@@ -2,12 +2,9 @@ package handlers_test
 
 import (
 	"bufio"
-	"bytes"
-	"crypto/rand"
 	"errors"
 	"io"
 	"net"
-	"runtime"
 	"strconv"
 	"time"
 
@@ -153,88 +150,6 @@ var _ = Describe("DirectTcpipChannelHandler", func() {
 					Eventually(completed).Should(Receive())
 				})
 			})
-		})
-	})
-
-	Context("when the app runs in a VM whose guest has an agent", func() {
-		var relay *fakeGuestAgentRelay
-
-		BeforeEach(func() {
-			if runtime.GOOS == "windows" {
-				Skip("the guest agent runs only on Linux cells")
-			}
-			relay = startFakeGuestAgentRelay(func(line string) string {
-				if line == "forward 127.0.0.1 9" {
-					return "error: connecting to 127.0.0.1 port 9 in the guest: connection refused"
-				}
-				return "ok"
-			}, func(line string, conn net.Conn) {
-				defer conn.Close()
-				data, err := io.ReadAll(conn)
-				if err != nil {
-					return
-				}
-				_, _ = conn.Write(data)
-			})
-			guestDialer := handlers.NewGuestAgentDialer(handlers.NewGuestAgent(relay.path), &net.Dialer{})
-			testDialer.DialStub = guestDialer.Dial
-		})
-
-		It("forwards through the guest agent's relay with the target host and port", func() {
-			conn, err := client.Dial("tcp", "127.0.0.1:8080")
-			Expect(err).NotTo(HaveOccurred())
-			conn.Close()
-			Expect(relay.Lines()).To(Equal([]string{"ping", "forward 127.0.0.1 8080"}))
-		})
-
-		It("passes megabytes of arbitrary bytes both ways unchanged, and the client's half-close to the guest", func() {
-			conn, err := client.Dial("tcp", "localhost:8080")
-			Expect(err).NotTo(HaveOccurred())
-			defer conn.Close()
-
-			data := make([]byte, 4<<20)
-			_, err = rand.Read(data)
-			Expect(err).NotTo(HaveOccurred())
-
-			go func() {
-				defer GinkgoRecover()
-				_, err := conn.Write(data)
-				Expect(err).NotTo(HaveOccurred())
-				Expect(conn.(interface{ CloseWrite() error }).CloseWrite()).To(Succeed())
-			}()
-
-			got, err := io.ReadAll(conn)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(len(got)).To(Equal(len(data)))
-			Expect(bytes.Equal(got, data)).To(BeTrue())
-		})
-
-		It("rejects the channel with the relay's reason when the guest cannot connect", func() {
-			_, err := client.Dial("tcp", "127.0.0.1:9")
-			Expect(err).To(Equal(&ssh.OpenChannelError{
-				Reason:  ssh.ConnectionFailed,
-				Message: "connecting to 127.0.0.1 port 9 in the guest: connection refused",
-			}))
-		})
-	})
-
-	Context("when the container has no guest agent", func() {
-		BeforeEach(func() {
-			guestDialer := handlers.NewGuestAgentDialer(handlers.NewGuestAgent("/nonexistent/vm-launch-agent.sock"), &net.Dialer{})
-			testDialer.DialStub = guestDialer.Dial
-		})
-
-		It("dials the target directly and copies data, as before", func() {
-			conn, err := client.Dial("tcp", echoAddress)
-			Expect(err).NotTo(HaveOccurred())
-			defer conn.Close()
-
-			_, err = conn.Write([]byte("Hello, World!\n"))
-			Expect(err).NotTo(HaveOccurred())
-			data, err := bufio.NewReader(conn).ReadString('\n')
-			Expect(err).NotTo(HaveOccurred())
-			Expect(data).To(Equal("Hello, World!\n"))
-			Expect(echoHandler.HandleConnectionCallCount()).To(Equal(1))
 		})
 	})
 

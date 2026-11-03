@@ -4,7 +4,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net"
 	"os"
 	"runtime"
 	"strings"
@@ -158,9 +157,7 @@ func runServer() error {
 
 	runner := handlers.NewCommandRunner()
 	shellLocator := handlers.NewShellLocator()
-	// In the container of an app that runs in a VM, a forward reaches the
-	// app's ports in the guest through the guest agent.
-	dialer := handlers.NewGuestAgentDialer(handlers.NewGuestAgent(handlers.GuestAgentSocketPath), &net.Dialer{})
+	sessionHandler, directTcpipHandler := newChannelHandlers(runner, shellLocator, getDaemonEnvironment(), 15*time.Second)
 
 	sshDaemon := daemon.New(
 		logger,
@@ -170,8 +167,8 @@ func runServer() error {
 			globalrequest.CancelTCPIPForward: new(globalrequest.CancelTCPIPForwardHandler),
 		},
 		map[string]handlers.NewChannelHandler{
-			"session":      handlers.NewSessionChannelHandler(runner, shellLocator, getDaemonEnvironment(), 15*time.Second),
-			"direct-tcpip": handlers.NewDirectTcpipChannelHandler(dialer),
+			"session":      sessionHandler,
+			"direct-tcpip": directTcpipHandler,
 		},
 	)
 	server, err := createServer(logger, *address, sshDaemon)
