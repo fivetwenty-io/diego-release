@@ -78,6 +78,12 @@ var allowedHostKeyAlgorithms = flag.String(
 	"Limit key host key algorithms to those provided (comma separated)",
 )
 
+var vmContainer = flag.Bool(
+	"vmContainer",
+	false,
+	"Serve scp, sftp, and forwards through the guest agent of the VM that runs the app, as the executor passes in VM containers only",
+)
+
 var hostKeyPEM string
 var authorizedKeyValue string
 
@@ -141,6 +147,7 @@ func runServer() error {
 			fmt.Sprintf("--allowedMACs=%s", *allowedMACs),
 			fmt.Sprintf("--allowedHostKeyAlgorithms=%s", *allowedHostKeyAlgorithms),
 			fmt.Sprintf("--logLevel=%s", logLevel),
+			fmt.Sprintf("--vmContainer=%t", *vmContainer),
 			fmt.Sprintf("--debugAddr=%s", debugserver.DebugAddress(flag.CommandLine)),
 		}, os.Environ())
 		if err != nil {
@@ -157,7 +164,7 @@ func runServer() error {
 
 	runner := handlers.NewCommandRunner()
 	shellLocator := handlers.NewShellLocator()
-	sessionHandler, directTcpipHandler := newChannelHandlers(runner, shellLocator, getDaemonEnvironment(), 15*time.Second)
+	sessionHandler, directTcpipHandler := newChannelHandlers(runner, shellLocator, getDaemonEnvironment(), 15*time.Second, *vmContainer)
 
 	sshDaemon := daemon.New(
 		logger,

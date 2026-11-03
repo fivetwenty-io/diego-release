@@ -166,17 +166,17 @@ var _ = Describe("DirectTcpipChannelHandler with a guest agent", func() {
 		})
 	})
 
-	Context("when a process of a runC or gVisor app answers ok at the socket", func() {
+	Context("when the relay says the guest has no agent by configuration", func() {
 		var relay *fakeGuestAgentRelay
 
 		BeforeEach(func() {
-			relay = startFakeGuestAgentRelay(agentOn, echoRelay)
-			agent = handlers.NewGuestAgent(relay.path, writeMountInfo(false))
+			relay = startFakeGuestAgentRelay(relayAnswers("off"), echoRelay)
+			agent = guestAgentAt(relay.path)
 		})
 
-		It("dials the target directly and never tells that process the target", func() {
+		It("dials the target from the container, as before", func() {
 			expectDirectEcho()
-			Expect(relay.Lines()).To(BeEmpty())
+			Expect(relay.Lines()).To(Equal([]string{"ping"}))
 		})
 	})
 
@@ -190,7 +190,7 @@ var _ = Describe("DirectTcpipChannelHandler with a guest agent", func() {
 		})
 	})
 
-	Context("when there is no guest agent at all", func() {
+	Context("when there is no guest agent at all, as without -vmContainer", func() {
 		It("dials the target directly and copies data, as before", func() {
 			expectDirectEcho()
 		})

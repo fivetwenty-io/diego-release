@@ -3,7 +3,6 @@
 package handlers
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -17,26 +16,11 @@ import (
 	"unicode"
 )
 
-const (
-	// GuestAgentSocketPath is where Garden's vm-launch listens for the
-	// guest agent's clients in the container of an app that runs in a VM.
-	// The shell that sshd starts in such a container is vm-launch's shim,
-	// which runs each command in the VM's guest through this socket.
-	GuestAgentSocketPath = "/tmp/vm-launch-agent.sock"
-
-	// GuestAgentShellPath is the shell over which Garden binds vm-launch in
-	// the container of an app whose VM guest has the agent. Garden makes
-	// that mount when it creates the container, and no process in a
-	// container can add a mount to sshd's mount namespace, so the mount is
-	// what tells sshd that it runs in such a container. A socket alone does
-	// not, because any process of a runC or gVisor app can create one at
-	// GuestAgentSocketPath.
-	GuestAgentShellPath = "/bin/bash"
-
-	// GuestAgentMountInfoPath is the mount table of sshd's own mount
-	// namespace.
-	GuestAgentMountInfoPath = "/proc/self/mountinfo"
-)
+// GuestAgentSocketPath is where Garden's vm-launch listens for the guest
+// agent's clients in the container of an app that runs in a VM. The shell
+// that sshd starts in such a container is vm-launch's shim, which runs each
+// command in the VM's guest through this socket.
+const GuestAgentSocketPath = "/tmp/vm-launch-agent.sock"
 
 const (
 	// guestAgentPingTimeout bounds a whole ping, from the dial to the
@@ -47,8 +31,7 @@ const (
 	// guestAgentAnswerLifetime is how long the relay's ok to a ping holds.
 	// Within it, scp, sftp, and forwards go to the guest without another
 	// ping. After it, or after a forward fails, the next one pings again,
-	// so an agent that has gone down sends sshd back to the container
-	// within this time.
+	// so an agent that has gone down is noticed within this time.
 	guestAgentAnswerLifetime = 10 * time.Second
 
 	// guestAgentForwardTimeout bounds the relay's answer to a forward,
@@ -58,89 +41,141 @@ const (
 
 	// guestAgentMaxAnswer is the most bytes the relay's answer may have.
 	guestAgentMaxAnswer = 512
+
+	// guestAgentOffPrefix starts the relay's answer to a ping when its
+	// guest has no agent by configuration, such as a vm-qemu container
+	// without vsock.
+	guestAgentOffPrefix = "off: "
+)
+
+// GuestAgentState is what a GuestAgent found when it was asked whether sshd
+// may serve through the guest agent.
+type GuestAgentState int
+
+const (
+	// GuestAgentAbsent means the container has no guest agent: there is no
+	// relay socket, or the relay says that its guest has no agent by
+	// configuration. sshd serves scp, sftp, and forwards in the container,
+	// as it did before the agent existed.
+	GuestAgentAbsent GuestAgentState = iota
+
+	// GuestAgentReady means the relay answered a ping with ok, which it
+	// does only once the guest's agent has answered it.
+	GuestAgentReady
+
+	// GuestAgentDown means the relay is there but its agent did not answer
+	// a ping. The app's files are in the guest, so sshd refuses scp and
+	// sftp rather than serve the container's files.
+	GuestAgentDown
 )
 
 // GuestAgent decides whether sshd serves scp, sftp, and direct-tcpip
 // forwards through a VM guest's agent, because the app's files and ports
-// are in the guest rather than in the container. It does so only when
-// sshd's mount table shows the shell that Garden binds for the agent, the
-// socket is there, and the relay answers a ping with ok, which it does only
-// once the guest's agent has answered it. On anything else sshd serves them
-// in the container as it always has.
+// are in the guest rather than in the container.
+//
+// sshd builds one only when the executor has passed it -vmContainer, which
+// the executor adds to the SSH daemon's arguments in the main action of a VM
+// container and nowhere else. In such a container the app runs in the guest
+// and only the platform runs in the container, so the relay socket is
+// vm-launch's. In a runC or gVisor container, any process of the app could
+// create a socket at GuestAgentSocketPath, which is why sshd never builds a
+// GuestAgent there.
 type GuestAgent struct {
-	socketPath    string
-	mountInfoPath string
-
-	// shellBound says whether the mount table shows GuestAgentShellPath as
-	// a mount point. Garden makes its mounts before sshd starts, so the
-	// mount table is read once.
-	shellBoundOnce sync.Once
-	shellBound     bool
+	socketPath string
 
 	// okUntil is when the relay's last ok to a ping stops holding, in
 	// nanoseconds since the epoch, or 0 when none holds.
 	okUntil atomic.Int64
 	now     func() time.Time
+
+	// probe is the ping in flight, which every caller that finds no ok
+	// holding waits for instead of sending its own.
+	probeMu sync.Mutex
+	probe   *guestAgentProbe
 }
 
-// NewGuestAgent returns the gate for the relay at socketPath, which opens
-// only when the mount table at mountInfoPath shows GuestAgentShellPath as
-// a mount point. sshd passes GuestAgentSocketPath and
-// GuestAgentMountInfoPath.
-func NewGuestAgent(socketPath, mountInfoPath string) *GuestAgent {
-	return &GuestAgent{socketPath: socketPath, mountInfoPath: mountInfoPath, now: time.Now}
+// guestAgentProbe is one ping and its result, which is set before done
+// closes.
+type guestAgentProbe struct {
+	done  chan struct{}
+	state GuestAgentState
+	err   error
 }
 
-// Available reports whether sshd should serve through the guest agent. A
-// nil GuestAgent is never available.
-func (agent *GuestAgent) Available() bool {
-	if agent == nil || !agent.isShellBound() {
-		return false
+// NewGuestAgent returns the gate for the relay at socketPath. sshd passes
+// GuestAgentSocketPath.
+func NewGuestAgent(socketPath string) *GuestAgent {
+	return &GuestAgent{socketPath: socketPath, now: time.Now}
+}
+
+// Check reports whether sshd should serve through the guest agent, and for
+// GuestAgentDown, and for GuestAgentAbsent when the relay said why, the
+// relay's reason. A nil GuestAgent is always absent. When no ok holds,
+// concurrent calls share one ping, so a burst of requests sends the relay
+// one ping rather than one each.
+func (agent *GuestAgent) Check() (GuestAgentState, error) {
+	if agent == nil {
+		return GuestAgentAbsent, nil
 	}
-	if agent.now().UnixNano() < agent.okUntil.Load() {
-		return true
+	if agent.answerHolds() {
+		return GuestAgentReady, nil
 	}
 
 	// vm-launch creates the socket itself, so a link is never the relay.
 	info, err := os.Lstat(agent.socketPath)
 	if err != nil || info.Mode().Type() != os.ModeSocket {
-		return false
+		return GuestAgentAbsent, nil
 	}
 
+	agent.probeMu.Lock()
+	if agent.answerHolds() {
+		agent.probeMu.Unlock()
+		return GuestAgentReady, nil
+	}
+	if probe := agent.probe; probe != nil {
+		agent.probeMu.Unlock()
+		<-probe.done
+		return probe.state, probe.err
+	}
+	probe := &guestAgentProbe{done: make(chan struct{})}
+	agent.probe = probe
+	agent.probeMu.Unlock()
+
+	probe.state, probe.err = agent.ping()
+	if probe.state == GuestAgentReady {
+		agent.okUntil.Store(agent.now().Add(guestAgentAnswerLifetime).UnixNano())
+	}
+
+	agent.probeMu.Lock()
+	agent.probe = nil
+	agent.probeMu.Unlock()
+	close(probe.done)
+	return probe.state, probe.err
+}
+
+func (agent *GuestAgent) answerHolds() bool {
+	return agent.now().UnixNano() < agent.okUntil.Load()
+}
+
+// ping asks the relay whether its agent answers.
+func (agent *GuestAgent) ping() (GuestAgentState, error) {
 	conn, err := agent.ask("ping", guestAgentPingTimeout)
-	if err != nil {
-		return false
+	if err == nil {
+		_ = conn.Close()
+		return GuestAgentReady, nil
 	}
-	_ = conn.Close()
-
-	agent.okUntil.Store(agent.now().Add(guestAgentAnswerLifetime).UnixNano())
-	return true
+	var off guestAgentOffError
+	if errors.As(err, &off) {
+		return GuestAgentAbsent, err
+	}
+	return GuestAgentDown, err
 }
 
-// isShellBound reports whether the mount table shows GuestAgentShellPath
-// as a mount point. A mount table that cannot be read shows none.
-func (agent *GuestAgent) isShellBound() bool {
-	agent.shellBoundOnce.Do(func() {
-		file, err := os.Open(agent.mountInfoPath)
-		if err != nil {
-			return
-		}
-		defer file.Close()
+// guestAgentOffError is the relay's answer when its guest has no agent by
+// configuration.
+type guestAgentOffError struct{ reason string }
 
-		// The mount point is the fifth field. It is escaped, with \040
-		// for a space, but GuestAgentShellPath has nothing to escape.
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 0, 4096), 1<<20)
-		for scanner.Scan() {
-			fields := strings.Fields(scanner.Text())
-			if len(fields) > 4 && fields[4] == GuestAgentShellPath {
-				agent.shellBound = true
-				return
-			}
-		}
-	})
-	return agent.shellBound
-}
+func (e guestAgentOffError) Error() string { return e.reason }
 
 // Forward connects to host and port in the guest through the relay and
 // returns a connection that carries the raw bytes of the guest's
@@ -200,7 +235,11 @@ func (agent *GuestAgent) ask(line string, timeout time.Duration) (net.Conn, erro
 		answer, err = readAnswer(conn)
 	}
 	if err == nil && answer != "ok" {
-		err = errors.New(strings.TrimPrefix(answer, "error: "))
+		if reason, off := strings.CutPrefix(answer, guestAgentOffPrefix); off {
+			err = guestAgentOffError{reason: reason}
+		} else {
+			err = errors.New(strings.TrimPrefix(answer, "error: "))
+		}
 	}
 	if err == nil {
 		err = conn.SetDeadline(time.Time{})
@@ -238,17 +277,23 @@ type guestAgentDialer struct {
 }
 
 // NewGuestAgentDialer returns a Dialer that connects through the guest
-// agent when it is available, so that a forward reaches the app's ports in
-// the guest, and through fallback otherwise. When the relay fails a
-// forward and the agent then no longer answers a ping, it dials through
-// fallback, so that a forward still reaches the ports that the hypervisor
-// forwards from the container while the agent is down.
+// agent when it is ready, so that a forward reaches the app's ports in the
+// guest, and through fallback otherwise. A guest without an agent gets the
+// container's dial that it always had. While the agent is down, the dialer
+// also dials through fallback, so that a forward still reaches the ports
+// that the hypervisor forwards from the container into the guest, and a
+// forward to any other port in the container is refused there, as it is
+// without the agent. When the relay fails a forward and the agent then no
+// longer answers a ping, the dialer falls back in the same way.
 func NewGuestAgentDialer(agent *GuestAgent, fallback Dialer) Dialer {
 	return &guestAgentDialer{agent: agent, fallback: fallback}
 }
 
 func (dialer *guestAgentDialer) Dial(network, addr string) (net.Conn, error) {
-	if network != "tcp" || !dialer.agent.Available() {
+	if network != "tcp" {
+		return dialer.fallback.Dial(network, addr)
+	}
+	if state, _ := dialer.agent.Check(); state != GuestAgentReady {
 		return dialer.fallback.Dial(network, addr)
 	}
 
@@ -274,7 +319,7 @@ func (dialer *guestAgentDialer) Dial(network, addr string) (net.Conn, error) {
 	}
 	// An agent that still answers gave the guest's own reason, such as a
 	// refused connect, which stands.
-	if dialer.agent.Available() {
+	if state, _ := dialer.agent.Check(); state == GuestAgentReady {
 		return nil, err
 	}
 	return dialer.fallback.Dial(network, addr)

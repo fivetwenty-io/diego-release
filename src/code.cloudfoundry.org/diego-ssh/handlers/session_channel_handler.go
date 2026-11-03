@@ -50,9 +50,9 @@ func NewSessionChannelHandler(
 }
 
 // NewSessionChannelHandlerWithGuestAgent returns a handler that runs scp and
-// sftp in the app's VM guest when guestAgent is available, and in sshd's own
-// process otherwise. A nil guestAgent is never available, which makes it
-// the handler that NewSessionChannelHandler returns.
+// sftp in the app's VM guest when guestAgent is ready, and in sshd's own
+// process otherwise. A nil guestAgent is always absent, which makes it the
+// handler that NewSessionChannelHandler returns.
 func NewSessionChannelHandlerWithGuestAgent(
 	runner Runner,
 	shellLocator ShellLocator,
@@ -328,7 +328,7 @@ func (sess *session) handleExecRequest(request *ssh.Request) {
 	}
 
 	if scpRegex.MatchString(execMessage.Command) {
-		if sess.guestAgent.Available() {
+		if state, _ := sess.guestAgent.Check(); state == GuestAgentReady {
 			logger.Info("handling-scp-command-in-guest", lager.Data{"Command": execMessage.Command})
 			sess.executeTransferInGuest(request, "-c", execMessage.Command)
 			return
@@ -377,7 +377,7 @@ func (sess *session) handleSubsystemRequest(request *ssh.Request) {
 		return
 	}
 
-	if sess.guestAgent.Available() {
+	if state, _ := sess.guestAgent.Check(); state == GuestAgentReady {
 		logger.Info("starting-server-in-guest")
 		sess.executeTransferInGuest(request, "-c", guestSFTPServerCommand)
 		return

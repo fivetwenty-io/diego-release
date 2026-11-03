@@ -22,14 +22,6 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-// The mount table of a container, and the line for the shell that Garden
-// binds for the guest agent in the container of a VM app.
-const (
-	containerMountInfo = "1205 1146 0:331 / / rw,relatime - overlay overlay rw\n" +
-		"1206 1205 0:333 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
-	guestShellMount = "1210 1205 8:1 /var/vcap/data/garden/vm-launch /bin/bash ro,nosuid,nodev,relatime - ext4 /dev/sda1 rw\n"
-)
-
 var _ = Describe("SSH daemon with a guest agent", func() {
 	var (
 		workDir string
@@ -39,6 +31,9 @@ var _ = Describe("SSH daemon with a guest agent", func() {
 
 		relayMu    sync.Mutex
 		relayLines []string
+
+		vmContainer bool
+		echoAddress string
 	)
 
 	// startRelay listens where the specs' sshd looks for the guest agent's
@@ -80,10 +75,6 @@ var _ = Describe("SSH daemon with a guest agent", func() {
 		return append([]string{}, relayLines...)
 	}
 
-	writeMountTable := func(contents string) {
-		Expect(os.WriteFile(filepath.Join(workDir, guestAgentDir, "mountinfo"), []byte(contents), 0600)).To(Succeed())
-	}
-
 	BeforeEach(func() {
 		var err error
 		// A short directory keeps the relay socket's path within the limit.
@@ -97,6 +88,27 @@ var _ = Describe("SSH daemon with a guest agent", func() {
 
 		port, err = portAllocator.ClaimPorts(1)
 		Expect(err).NotTo(HaveOccurred())
+
+		vmContainer = false
+
+		// echoAddress is a TCP port in the container, which a forward that
+		// sshd dials itself reaches.
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(listener.Close)
+		echoAddress = listener.Addr().String()
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				go func() {
+					defer conn.Close()
+					_, _ = io.Copy(conn, conn)
+				}()
+			}
+		}()
 	})
 
 	JustBeforeEach(func() {
@@ -104,6 +116,7 @@ var _ = Describe("SSH daemon with a guest agent", func() {
 			Address:       "127.0.0.1:" + strconv.Itoa(int(port)),
 			HostKey:       hostKeyPem,
 			AuthorizedKey: publicAuthorizedKey,
+			VMContainer:   vmContainer,
 		})
 		runner.Command.Dir = workDir
 		process = ginkgomon.Invoke(runner)
@@ -125,65 +138,62 @@ var _ = Describe("SSH daemon with a guest agent", func() {
 		ginkgomon.Kill(process, 3*time.Second)
 	})
 
-	Context("when the mount table shows the shell that Garden binds for the agent", func() {
+	// expectEcho forwards to addr through sshd and expects what it writes
+	// back.
+	expectEcho := func(addr, text string) {
+		conn, err := client.Dial("tcp", addr)
+		Expect(err).NotTo(HaveOccurred())
+		defer conn.Close()
+		_, err = io.WriteString(conn, text)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(conn.(interface{ CloseWrite() error }).CloseWrite()).To(Succeed())
+		Expect(io.ReadAll(conn)).To(Equal([]byte(text)))
+	}
+
+	Context("when the executor passes -vmContainer, as it does in the main action of a VM container", func() {
 		BeforeEach(func() {
-			writeMountTable(containerMountInfo + guestShellMount)
-			startRelay()
+			vmContainer = true
 		})
 
-		It("sends scp and forwards through the one gate that main wires, which pings once for both", func() {
-			session, err := client.NewSession()
-			Expect(err).NotTo(HaveOccurred())
-			// The shell runs scp, as the shim would in the guest, and what
-			// it answers does not matter here.
-			_, _ = session.CombinedOutput("scp -h")
-			session.Close()
-			Expect(lines()).To(Equal([]string{"ping"}))
+		Context("and the relay answers", func() {
+			BeforeEach(func() {
+				startRelay()
+			})
 
-			conn, err := client.Dial("tcp", "127.0.0.1:8080")
-			Expect(err).NotTo(HaveOccurred())
-			defer conn.Close()
-			_, err = io.WriteString(conn, "through the guest")
-			Expect(err).NotTo(HaveOccurred())
-			Expect(conn.(interface{ CloseWrite() error }).CloseWrite()).To(Succeed())
-			Expect(io.ReadAll(conn)).To(Equal([]byte("through the guest")))
-			Expect(lines()).To(Equal([]string{"ping", "forward 127.0.0.1 8080"}))
+			It("sends scp and forwards through the one gate that main wires, which pings once for both", func() {
+				session, err := client.NewSession()
+				Expect(err).NotTo(HaveOccurred())
+				// The shell runs scp, as the shim would in the guest, and
+				// what it answers does not matter here.
+				_, _ = session.CombinedOutput("scp -h")
+				session.Close()
+				Expect(lines()).To(Equal([]string{"ping"}))
+
+				expectEcho("127.0.0.1:8080", "through the guest")
+				Expect(lines()).To(Equal([]string{"ping", "forward 127.0.0.1 8080"}))
+			})
+		})
+
+		Context("and there is no relay socket", func() {
+			It("dials the target itself, as before", func() {
+				expectEcho(echoAddress, "from the container")
+				Expect(lines()).To(BeEmpty())
+			})
 		})
 	})
 
-	Context("when a socket answers ok but the mount table does not show the shell's mount, as in a runC or gVisor container", func() {
-		var echoAddress string
-
+	Context("when the executor does not pass -vmContainer, though a socket at the relay's path answers ok, as an app in a runC or gVisor container could make one", func() {
 		BeforeEach(func() {
-			writeMountTable(containerMountInfo)
 			startRelay()
-
-			listener, err := net.Listen("tcp", "127.0.0.1:0")
-			Expect(err).NotTo(HaveOccurred())
-			DeferCleanup(listener.Close)
-			echoAddress = listener.Addr().String()
-			go func() {
-				for {
-					conn, err := listener.Accept()
-					if err != nil {
-						return
-					}
-					go func() {
-						defer conn.Close()
-						_, _ = io.Copy(conn, conn)
-					}()
-				}
-			}()
 		})
 
-		It("dials the target itself and never asks the socket", func() {
-			conn, err := client.Dial("tcp", echoAddress)
+		It("serves scp and forwards itself and never asks the socket", func() {
+			session, err := client.NewSession()
 			Expect(err).NotTo(HaveOccurred())
-			defer conn.Close()
-			_, err = io.WriteString(conn, "from the container")
-			Expect(err).NotTo(HaveOccurred())
-			Expect(conn.(interface{ CloseWrite() error }).CloseWrite()).To(Succeed())
-			Expect(io.ReadAll(conn)).To(Equal([]byte("from the container")))
+			_, _ = session.CombinedOutput("scp -h")
+			session.Close()
+
+			expectEcho(echoAddress, "from the container")
 			Expect(lines()).To(BeEmpty())
 		})
 	})

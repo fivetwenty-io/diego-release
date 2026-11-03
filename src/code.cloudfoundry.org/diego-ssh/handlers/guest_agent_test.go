@@ -125,6 +125,9 @@ func relayAnswers(state string) func(string) string {
 		}
 		switch state {
 		case "off":
+			if fields[0] == "ping" {
+				return "off: this guest has no agent for cf ssh, because it is a spec"
+			}
 			return "error: this guest has no agent for cf ssh, because it is a spec"
 		case "down":
 			if fields[0] == "ping" {
@@ -139,35 +142,10 @@ func relayAnswers(state string) func(string) string {
 // agentOn answers as a relay whose guest's agent answers.
 var agentOn = relayAnswers("agent")
 
-// mountInfo is a container's mount table without the shell that Garden
-// binds for the guest agent, and shellMount is that mount's line.
-const (
-	mountInfo = `1205 1146 0:331 / / rw,relatime - overlay overlay rw,lowerdir=/var/vcap/data/grootfs/l
-1206 1205 0:333 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
-1207 1205 0:334 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755
-1208 1205 8:1 /var/vcap/data/garden/vm-launch /opt/garden-vm/vm-launch ro,nosuid,nodev,relatime - ext4 /dev/sda1 rw
-1209 1205 8:1 /var/vcap/data/garden/artifacts/bin/bash /opt/bin\040bash ro,nosuid,nodev,relatime - ext4 /dev/sda1 rw
-`
-	shellMount = `1210 1205 8:1 /var/vcap/data/garden/vm-launch /bin/bash ro,nosuid,nodev,relatime - ext4 /dev/sda1 rw
-`
-)
-
-// writeMountInfo writes a mount table, with the shell's mount when
-// shellBound is set, and returns its path.
-func writeMountInfo(shellBound bool) string {
-	contents := mountInfo
-	if shellBound {
-		contents += shellMount
-	}
-	path := filepath.Join(GinkgoT().TempDir(), "mountinfo")
-	Expect(os.WriteFile(path, []byte(contents), 0600)).To(Succeed())
-	return path
-}
-
-// guestAgentAt returns the gate for the relay at socketPath in a container
-// whose mount table shows the shell that Garden binds for the agent.
+// guestAgentAt returns the gate for the relay at socketPath, as sshd builds
+// it when the executor passes -vmContainer.
 func guestAgentAt(socketPath string) *handlers.GuestAgent {
-	return handlers.NewGuestAgent(socketPath, writeMountInfo(true))
+	return handlers.NewGuestAgent(socketPath)
 }
 
 // stalledRelay listens at a socket and never answers, and returns the
@@ -203,76 +181,96 @@ func stalledRelay() string {
 	return path
 }
 
+// heldPings answers as relayAnswers(state) does, but holds each answer to a
+// ping until release closes, so that a spec can start a burst of requests
+// while the first ping is still in flight.
+func heldPings(state string, release <-chan struct{}) func(string) string {
+	answer := relayAnswers(state)
+	return func(line string) string {
+		if line == "ping" {
+			<-release
+		}
+		return answer(line)
+	}
+}
+
+// burst runs n calls of f at once and waits for them all.
+func burst(n int, f func()) {
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer GinkgoRecover()
+			defer wg.Done()
+			f()
+		}()
+	}
+	wg.Wait()
+}
+
+// countLines returns how many of lines are line.
+func countLines(lines []string, line string) int {
+	n := 0
+	for _, l := range lines {
+		if l == line {
+			n++
+		}
+	}
+	return n
+}
+
 var _ = Describe("GuestAgent", func() {
-	It("is not available without a socket, as in the container of an app that does not run in a VM", func() {
+	expectState := func(agent *handlers.GuestAgent, want handlers.GuestAgentState) error {
+		GinkgoHelper()
+		state, err := agent.Check()
+		Expect(state).To(Equal(want))
+		return err
+	}
+
+	It("is absent without a socket, as before the guest has started", func() {
 		agent := guestAgentAt(filepath.Join(GinkgoT().TempDir(), "agent.sock"))
-		Expect(agent.Available()).To(BeFalse())
+		Expect(expectState(agent, handlers.GuestAgentAbsent)).To(Succeed())
 	})
 
-	It("is not available when the path is not a socket, or is a link to one", func() {
+	It("is absent when the path is not a socket, or is a link to one", func() {
 		path := filepath.Join(GinkgoT().TempDir(), "agent.sock")
 		Expect(os.WriteFile(path, nil, 0600)).To(Succeed())
-		Expect(guestAgentAt(path).Available()).To(BeFalse())
+		Expect(expectState(guestAgentAt(path), handlers.GuestAgentAbsent)).To(Succeed())
 
 		relay := startFakeGuestAgentRelay(agentOn, nil)
 		link := filepath.Join(GinkgoT().TempDir(), "agent.sock")
 		Expect(os.Symlink(relay.path, link)).To(Succeed())
-		Expect(guestAgentAt(link).Available()).To(BeFalse())
+		Expect(expectState(guestAgentAt(link), handlers.GuestAgentAbsent)).To(Succeed())
 		Expect(relay.Lines()).To(BeEmpty())
 	})
 
-	It("is never available when nil", func() {
+	It("is always absent when nil, as it is without -vmContainer", func() {
 		var agent *handlers.GuestAgent
-		Expect(agent.Available()).To(BeFalse())
+		Expect(expectState(agent, handlers.GuestAgentAbsent)).To(Succeed())
 	})
 
-	Context("when a process of the app answers ok at the socket, as one in a runC or gVisor container can", func() {
-		var relay *fakeGuestAgentRelay
-
-		BeforeEach(func() {
-			relay = startFakeGuestAgentRelay(agentOn, nil)
-		})
-
-		It("is not available, and never asks the socket, while sshd's mount table does not show the shell's mount", func() {
-			agent := handlers.NewGuestAgent(relay.path, writeMountInfo(false))
-			Expect(agent.Available()).To(BeFalse())
-			Expect(agent.Available()).To(BeFalse())
-			Expect(relay.Lines()).To(BeEmpty())
-		})
-
-		It("is not available when the mount table cannot be read", func() {
-			agent := handlers.NewGuestAgent(relay.path, filepath.Join(GinkgoT().TempDir(), "mountinfo"))
-			Expect(agent.Available()).To(BeFalse())
-			Expect(relay.Lines()).To(BeEmpty())
-		})
-
-		It("is not available when /bin/bash is only the root of a mount, or a mount point's prefix", func() {
-			path := filepath.Join(GinkgoT().TempDir(), "mountinfo")
-			Expect(os.WriteFile(path, []byte(mountInfo+
-				"1211 1205 8:1 /bin/bash /opt/shell ro - ext4 /dev/sda1 rw\n"+
-				"1212 1205 8:1 /x /bin/bashful ro - ext4 /dev/sda1 rw\n"+
-				"1213 1205 8:1 /x /bin/bash/x ro - ext4 /dev/sda1 rw\n"), 0600)).To(Succeed())
-			Expect(handlers.NewGuestAgent(relay.path, path).Available()).To(BeFalse())
-			Expect(relay.Lines()).To(BeEmpty())
-		})
+	It("is absent, with the relay's reason, when the relay says the guest has no agent by configuration", func() {
+		relay := startFakeGuestAgentRelay(relayAnswers("off"), nil)
+		err := expectState(guestAgentAt(relay.path), handlers.GuestAgentAbsent)
+		Expect(err).To(MatchError("this guest has no agent for cf ssh, because it is a spec"))
+		Expect(relay.Lines()).To(Equal([]string{"ping"}))
 	})
 
-	It("is not available when the relay says the guest has no agent, or that its agent is down", func() {
-		for _, state := range []string{"off", "down"} {
-			relay := startFakeGuestAgentRelay(relayAnswers(state), nil)
-			Expect(guestAgentAt(relay.path).Available()).To(BeFalse())
-			Expect(relay.Lines()).To(Equal([]string{"ping"}))
-		}
+	It("is down, with the relay's reason, when the relay says the guest's agent did not answer", func() {
+		relay := startFakeGuestAgentRelay(relayAnswers("down"), nil)
+		err := expectState(guestAgentAt(relay.path), handlers.GuestAgentDown)
+		Expect(err).To(MatchError("the guest agent did not answer a ping: the agent is down"))
+		Expect(relay.Lines()).To(Equal([]string{"ping"}))
 	})
 
-	It("is not available when the relay does not know the ping, as an older vm-launch's does not", func() {
+	It("is down when the relay does not know the ping, as an older vm-launch's does not", func() {
 		relay := startFakeGuestAgentRelay(func(line string) string {
 			return `error: the guest agent relay takes "session" or "forward HOST PORT", not "` + line + `"`
 		}, nil)
-		Expect(guestAgentAt(relay.path).Available()).To(BeFalse())
+		Expect(expectState(guestAgentAt(relay.path), handlers.GuestAgentDown)).To(HaveOccurred())
 	})
 
-	It("is not available when the relay closes without an answer", func() {
+	It("is down when the relay closes without an answer", func() {
 		dir, err := os.MkdirTemp("", "relay")
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(os.RemoveAll, dir)
@@ -289,17 +287,17 @@ var _ = Describe("GuestAgent", func() {
 				conn.Close()
 			}
 		}()
-		Expect(guestAgentAt(path).Available()).To(BeFalse())
+		Expect(expectState(guestAgentAt(path), handlers.GuestAgentDown)).To(HaveOccurred())
 	})
 
 	It("gives up on a relay that does not answer within one timeout of four seconds, for the dial and the answer together", func() {
 		agent := guestAgentAt(stalledRelay())
 		start := time.Now()
-		Expect(agent.Available()).To(BeFalse())
+		Expect(expectState(agent, handlers.GuestAgentDown)).To(HaveOccurred())
 		Expect(time.Since(start)).To(BeNumerically("~", 4*time.Second, 750*time.Millisecond))
 	})
 
-	It("is available once the relay answers the ping with ok, and does not ask again for ten seconds", func() {
+	It("is ready once the relay answers the ping with ok, and does not ask again for ten seconds", func() {
 		relay := startFakeGuestAgentRelay(agentOn, nil)
 		agent := guestAgentAt(relay.path)
 		now := time.Now()
@@ -315,17 +313,17 @@ var _ = Describe("GuestAgent", func() {
 			now = now.Add(d)
 		}
 
-		Expect(agent.Available()).To(BeTrue())
+		Expect(expectState(agent, handlers.GuestAgentReady)).To(Succeed())
 		advance(9 * time.Second)
-		Expect(agent.Available()).To(BeTrue())
+		Expect(expectState(agent, handlers.GuestAgentReady)).To(Succeed())
 		Expect(relay.Lines()).To(Equal([]string{"ping"}))
 
 		advance(2 * time.Second)
-		Expect(agent.Available()).To(BeTrue())
+		Expect(expectState(agent, handlers.GuestAgentReady)).To(Succeed())
 		Expect(relay.Lines()).To(Equal([]string{"ping", "ping"}))
 	})
 
-	It("is no longer available once the ok has lapsed and the relay says the agent is down", func() {
+	It("is down once the ok has lapsed and the relay says the agent is down", func() {
 		var mu sync.Mutex
 		state := "agent"
 		relay := startFakeGuestAgentRelay(func(line string) string {
@@ -337,13 +335,13 @@ var _ = Describe("GuestAgent", func() {
 		now := time.Now()
 		handlers.SetGuestAgentClock(agent, func() time.Time { return now })
 
-		Expect(agent.Available()).To(BeTrue())
+		Expect(expectState(agent, handlers.GuestAgentReady)).To(Succeed())
 		mu.Lock()
 		state = "down"
 		mu.Unlock()
-		Expect(agent.Available()).To(BeTrue())
+		Expect(expectState(agent, handlers.GuestAgentReady)).To(Succeed())
 		now = now.Add(11 * time.Second)
-		Expect(agent.Available()).To(BeFalse())
+		Expect(expectState(agent, handlers.GuestAgentDown)).To(HaveOccurred())
 		Expect(relay.Lines()).To(Equal([]string{"ping", "ping"}))
 	})
 
@@ -359,13 +357,44 @@ var _ = Describe("GuestAgent", func() {
 			return "error: not yet"
 		}, nil)
 		agent := guestAgentAt(relay.path)
-		Expect(agent.Available()).To(BeFalse())
+		Expect(expectState(agent, handlers.GuestAgentDown)).To(MatchError("not yet"))
 		mu.Lock()
 		on = true
 		mu.Unlock()
-		Expect(agent.Available()).To(BeTrue())
+		Expect(expectState(agent, handlers.GuestAgentReady)).To(Succeed())
 		Expect(relay.Lines()).To(Equal([]string{"ping", "ping"}))
 	})
+
+	DescribeTable("sends one ping for a burst of 20 checks while no ok holds, and gives each the ping's result",
+		func(state string, want handlers.GuestAgentState) {
+			release := make(chan struct{})
+			relay := startFakeGuestAgentRelay(heldPings(state, release), nil)
+			agent := guestAgentAt(relay.path)
+
+			results := make(chan handlers.GuestAgentState, 20)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				burst(20, func() {
+					state, _ := agent.Check()
+					results <- state
+				})
+			}()
+			Eventually(relay.Lines).Should(Equal([]string{"ping"}))
+			Consistently(relay.Lines, 300*time.Millisecond).Should(Equal([]string{"ping"}))
+			close(release)
+			Eventually(done).Should(BeClosed())
+
+			close(results)
+			for state := range results {
+				Expect(state).To(Equal(want))
+			}
+			Expect(relay.Lines()).To(Equal([]string{"ping"}))
+		},
+		Entry("when the agent answers", "agent", handlers.GuestAgentReady),
+		Entry("when the agent is down", "down", handlers.GuestAgentDown),
+		Entry("when the guest has no agent", "off", handlers.GuestAgentAbsent),
+	)
 
 	Describe("Forward", func() {
 		It("asks the relay for the host and port, and returns the stream that follows the ok", func() {
@@ -396,17 +425,17 @@ var _ = Describe("GuestAgent", func() {
 				return "ok"
 			}, nil)
 			agent := guestAgentAt(relay.path)
-			Expect(agent.Available()).To(BeTrue())
+			Expect(expectState(agent, handlers.GuestAgentReady)).To(Succeed())
 			_, err := agent.Forward("127.0.0.1", 9)
 			Expect(err).To(MatchError("connecting to 127.0.0.1 port 9 in the guest: connection refused"))
-			Expect(agent.Available()).To(BeTrue())
+			Expect(expectState(agent, handlers.GuestAgentReady)).To(Succeed())
 			Expect(relay.Lines()).To(Equal([]string{"ping", "forward 127.0.0.1 9", "ping"}))
 		})
 
 		It("refuses a host that would not be one field of the relay's line, and a port that is not a TCP port, without asking the relay", func() {
 			relay := startFakeGuestAgentRelay(agentOn, nil)
 			agent := guestAgentAt(relay.path)
-			for _, host := range []string{"localhost 80\nforward evil", "local\thost", "local host", "local\x00host"} {
+			for _, host := range []string{"localhost 80\nforward evil", "local\thost", "local host", "local\x00host"} {
 				_, err := agent.Forward(host, 8080)
 				Expect(err).To(MatchError(ContainSubstring("is not a host name or address")))
 			}
@@ -426,7 +455,7 @@ var _ = Describe("GuestAgent", func() {
 			fallback.DialReturns(nil, errors.New("the fallback dialer"))
 		})
 
-		It("dials with the fallback dialer, unchanged, when the guest agent is not available", func() {
+		It("dials with the fallback dialer, unchanged, when there is no relay socket", func() {
 			dialer := handlers.NewGuestAgentDialer(guestAgentAt(filepath.Join(GinkgoT().TempDir(), "agent.sock")), fallback)
 			_, err := dialer.Dial("tcp", "10.0.0.1:8080")
 			Expect(err).To(MatchError("the fallback dialer"))
@@ -436,16 +465,27 @@ var _ = Describe("GuestAgent", func() {
 			Expect(addr).To(Equal("10.0.0.1:8080"))
 		})
 
-		It("dials with the fallback dialer when an app's own socket answers ok without the shell's mount", func() {
-			relay := startFakeGuestAgentRelay(agentOn, func(line string, conn net.Conn) { conn.Close() })
-			dialer := handlers.NewGuestAgentDialer(handlers.NewGuestAgent(relay.path, writeMountInfo(false)), fallback)
+		DescribeTable("dials with the fallback dialer, after one ping, when the agent is not ready",
+			func(state string) {
+				relay := startFakeGuestAgentRelay(relayAnswers(state), nil)
+				dialer := handlers.NewGuestAgentDialer(guestAgentAt(relay.path), fallback)
+				_, err := dialer.Dial("tcp", "127.0.0.1:8080")
+				Expect(err).To(MatchError("the fallback dialer"))
+				Expect(fallback.DialCallCount()).To(Equal(1))
+				Expect(relay.Lines()).To(Equal([]string{"ping"}))
+			},
+			Entry("when the guest has no agent by configuration", "off"),
+			Entry("when the guest's agent is down, so a declared port still reaches the guest through the hypervisor", "down"),
+		)
+
+		It("dials with the fallback dialer when it has no gate, as without -vmContainer", func() {
+			dialer := handlers.NewGuestAgentDialer(nil, fallback)
 			_, err := dialer.Dial("tcp", "prod-db.internal:5432")
 			Expect(err).To(MatchError("the fallback dialer"))
 			Expect(fallback.DialCallCount()).To(Equal(1))
-			Expect(relay.Lines()).To(BeEmpty())
 		})
 
-		It("forwards through the guest agent when it is available, with the host and port of the address", func() {
+		It("forwards through the guest agent when it is ready, with the host and port of the address", func() {
 			relay := startFakeGuestAgentRelay(agentOn, func(line string, conn net.Conn) { conn.Close() })
 			dialer := handlers.NewGuestAgentDialer(guestAgentAt(relay.path), fallback)
 			for _, addr := range []string{"localhost:8080", "::1:8081", "[::1]:8082"} {
@@ -454,6 +494,32 @@ var _ = Describe("GuestAgent", func() {
 				conn.Close()
 			}
 			Expect(relay.Lines()).To(Equal([]string{"ping", "forward localhost 8080", "forward ::1 8081", "forward ::1 8082"}))
+			Expect(fallback.DialCallCount()).To(BeZero())
+		})
+
+		It("sends one ping for a burst of 20 forwards, and forwards each one", func() {
+			release := make(chan struct{})
+			relay := startFakeGuestAgentRelay(heldPings("agent", release), func(line string, conn net.Conn) { conn.Close() })
+			dialer := handlers.NewGuestAgentDialer(guestAgentAt(relay.path), fallback)
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				burst(20, func() {
+					conn, err := dialer.Dial("tcp", "127.0.0.1:8080")
+					Expect(err).NotTo(HaveOccurred())
+					conn.Close()
+				})
+			}()
+			Eventually(relay.Lines).Should(Equal([]string{"ping"}))
+			Consistently(relay.Lines, 300*time.Millisecond).Should(Equal([]string{"ping"}))
+			close(release)
+			Eventually(done).Should(BeClosed())
+
+			lines := relay.Lines()
+			Expect(lines).To(HaveLen(21))
+			Expect(lines[0]).To(Equal("ping"))
+			Expect(countLines(lines, "forward 127.0.0.1 8080")).To(Equal(20))
 			Expect(fallback.DialCallCount()).To(BeZero())
 		})
 
@@ -545,6 +611,8 @@ var _ = Describe("GuestAgent", func() {
 				Expect(answer).To(Equal("ok"), text)
 			case "error:":
 				Expect(answer).To(MatchRegexp(`^error: \S`), text)
+			case "off:":
+				Expect(answer).To(MatchRegexp(`^off: \S`), text)
 			default:
 				Fail("the contract has no answer " + want)
 			}

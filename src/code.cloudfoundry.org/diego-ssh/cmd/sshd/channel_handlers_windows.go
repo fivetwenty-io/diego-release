@@ -10,8 +10,9 @@ import (
 )
 
 // newChannelHandlers returns the session and direct-tcpip handlers. A
-// Windows cell runs no VM apps, so it has no guest agent gate.
-func newChannelHandlers(runner handlers.Runner, shellLocator handlers.ShellLocator, defaultEnv map[string]string, keepalive time.Duration) (handlers.NewChannelHandler, handlers.NewChannelHandler) {
+// Windows cell runs no VM apps, so it has no guest agent gate and ignores
+// vmContainer.
+func newChannelHandlers(runner handlers.Runner, shellLocator handlers.ShellLocator, defaultEnv map[string]string, keepalive time.Duration, _ bool) (handlers.NewChannelHandler, handlers.NewChannelHandler) {
 	return handlers.NewSessionChannelHandler(runner, shellLocator, defaultEnv, keepalive),
 		handlers.NewDirectTcpipChannelHandler(&net.Dialer{})
 }

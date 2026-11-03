@@ -335,28 +335,6 @@ exit 3
 		itServesTransfersInProcess()
 	})
 
-	Context("when a process of a runC or gVisor app answers ok at the socket, without the shell's mount", func() {
-		var relay *fakeGuestAgentRelay
-
-		BeforeEach(func() {
-			relay = startFakeGuestAgentRelay(agentOn, nil)
-			agent = handlers.NewGuestAgent(relay.path, writeMountInfo(false))
-		})
-
-		itServesTransfersInProcess()
-
-		It("never asks that process", func() {
-			sftpClient, err := sftp.NewClient(client)
-			Expect(err).NotTo(HaveOccurred())
-			_, err = sftpClient.Getwd()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(sftpClient.Close()).To(Succeed())
-			output, err := newSession().Output("scp -h")
-			Expect(err).To(HaveOccurred(), string(output))
-			Expect(relay.Lines()).To(BeEmpty())
-		})
-	})
-
 	Context("when the relay says the guest has no agent", func() {
 		BeforeEach(func() {
 			relay := startFakeGuestAgentRelay(relayAnswers("off"), nil)
@@ -375,7 +353,7 @@ exit 3
 		itServesTransfersInProcess()
 	})
 
-	Context("when there is no guest agent at all", func() {
+	Context("when there is no guest agent at all, as without -vmContainer", func() {
 		itServesTransfersInProcess()
 	})
 })
