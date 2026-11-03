@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -417,10 +418,13 @@ func (sess *session) handleSubsystemRequest(request *ssh.Request) {
 	logger.Info("starting-server")
 	go func() {
 		defer sess.destroy()
-		err = sftpServer.Serve()
-		if err != nil {
-			logger.Error("sftp-serve-error", err)
+		serveErr := sftpServer.Serve()
+		if serveErr != nil && !errors.Is(serveErr, io.EOF) {
+			logger.Error("sftp-serve-error", serveErr)
+		} else {
+			serveErr = nil
 		}
+		sess.sendSCPExitMessage(serveErr)
 	}()
 }
 

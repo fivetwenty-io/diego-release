@@ -952,6 +952,75 @@ var _ = Describe("SessionChannelHandler", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(os.IsNotExist(err)).To(BeTrue())
 		})
+
+		Context("when the sftp session ends", func() {
+			var (
+				channel  ssh.Channel
+				requests <-chan *ssh.Request
+				exitCh   chan *uint32
+			)
+
+			BeforeEach(func() {
+				type subsysMsg struct{ Subsystem string }
+
+				var err error
+				channel, requests, err = client.OpenChannel("session", nil)
+				Expect(err).NotTo(HaveOccurred())
+
+				accepted, err := channel.SendRequest("subsystem", true, ssh.Marshal(subsysMsg{Subsystem: "sftp"}))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(accepted).To(BeTrue())
+
+				// The session records the exit status the server sends, or nil
+				// if the server closes the channel without sending one.
+				exitCh = make(chan *uint32, 1)
+				go func() {
+					defer GinkgoRecover()
+
+					var status *uint32
+					for req := range requests {
+						if req.Type == "exit-status" {
+							var msg struct{ Status uint32 }
+							Expect(ssh.Unmarshal(req.Payload, &msg)).To(Succeed())
+							status = &msg.Status
+						}
+						if req.WantReply {
+							req.Reply(false, nil)
+						}
+					}
+					exitCh <- status
+				}()
+			})
+
+			AfterEach(func() {
+				channel.Close()
+			})
+
+			It("sends exit status 0 after the sftp client closes", func() {
+				sftpClient, err := sftp.NewClientPipe(channel, closeWriter{channel})
+				Expect(err).NotTo(HaveOccurred())
+
+				_, err = sftpClient.Getwd()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(sftpClient.Close()).To(Succeed())
+
+				var status *uint32
+				Eventually(exitCh).Should(Receive(&status))
+				Expect(status).NotTo(BeNil())
+				Expect(*status).To(BeEquivalentTo(0))
+			})
+
+			It("sends exit status 1 when the sftp server fails", func() {
+				By("sending a packet with a zero length, which the sftp server rejects")
+				_, err := channel.Write([]byte{0, 0, 0, 0})
+				Expect(err).NotTo(HaveOccurred())
+
+				var status *uint32
+				Eventually(exitCh).Should(Receive(&status))
+				Expect(status).NotTo(BeNil())
+				Expect(*status).To(BeEquivalentTo(1))
+			})
+		})
 	})
 
 	Describe("invalid session channel requests", func() {
@@ -1021,3 +1090,13 @@ var _ = Describe("SessionChannelHandler", func() {
 		})
 	})
 })
+
+// closeWriter closes only the write side of an ssh channel, so that the
+// client can still receive the exit status after it closes its sftp client.
+type closeWriter struct {
+	ssh.Channel
+}
+
+func (c closeWriter) Close() error {
+	return c.CloseWrite()
+}
