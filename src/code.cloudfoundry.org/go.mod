@@ -74,7 +74,7 @@ require (
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/openzipkin/zipkin-go v0.4.3
 	github.com/pborman/getopt v1.1.0
-	github.com/pkg/sftp v1.13.11
+	github.com/pkg/sftp v1.13.12
 	github.com/spf13/cobra v1.10.2
 	github.com/square/certstrap v1.3.0
 	github.com/tedsuo/ifrit v0.0.0-20260908181113-dd353a7daa27
