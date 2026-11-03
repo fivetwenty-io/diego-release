@@ -15,7 +15,7 @@ import (
 var guestAgentSocketPath = handlers.GuestAgentSocketPath
 
 // newChannelHandlers returns the session and direct-tcpip handlers. In a VM
-// container, which the executor marks with -vmContainer, they share one
+// container, which the executor marks with a trailing vm-container argument, they share one
 // guest agent gate, so that scp, sftp, and forwards reach the app's files and
 // ports in the guest. Anywhere else they are the plain handlers, which never
 // look at the relay's socket, because any process of a runC or gVisor app

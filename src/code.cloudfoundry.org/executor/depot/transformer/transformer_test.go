@@ -2,6 +2,7 @@ package transformer_test
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -326,7 +327,7 @@ var _ = Describe("Transformer", func() {
 					start()
 					Eventually(func() int { return len(argsOf(executor.SSHDPath)) }).Should(Equal(1))
 					Eventually(func() int { return len(argsOf("/action/path")) }).Should(Equal(1))
-					Expect(argsOf(executor.SSHDPath)).To(Equal([][]string{append(append([]string{}, sshdArgs...), "-vmContainer")}))
+					Expect(argsOf(executor.SSHDPath)).To(Equal([][]string{append(append([]string{}, sshdArgs...), executor.SSHDVMContainerMarker)}))
 					Expect(argsOf("/action/path")).To(Equal([][]string{{"app"}}))
 					Expect(models.UnwrapAction(container.Action).(*models.CodependentAction).Actions[1].RunAction.Args).To(Equal(sshdArgs))
 				},
@@ -334,7 +335,28 @@ var _ = Describe("Transformer", func() {
 				Entry("firecracker", "vm-firecracker"),
 			)
 
-			It("adds the flag to no run of the SSH daemon outside the main action of a VM container", func() {
+			It("leaves a diego-sshd from before the marker able to parse its arguments, because it stops at the bare trailing word", func() {
+				container.ExecutionBackend = "vm-qemu"
+				start()
+				Eventually(func() int { return len(argsOf(executor.SSHDPath)) }).Should(Equal(1))
+				got := argsOf(executor.SSHDPath)[0]
+				Expect(got[len(got)-1]).To(Equal("vm-container"))
+
+				// The old sshd defines only its own flags and parses with the
+				// default, exit-on-error behavior, which would reject an
+				// unknown -vmContainer flag.
+				old := flag.NewFlagSet("old-sshd", flag.ContinueOnError)
+				old.SetOutput(io.Discard)
+				address := old.String("address", "", "")
+				inherit := old.Bool("inheritDaemonEnv", false, "")
+				logLevel := old.String("logLevel", "", "")
+				Expect(old.Parse(got)).To(Succeed())
+				Expect(*address).To(Equal("0.0.0.0:2222"))
+				Expect(*inherit).To(BeTrue())
+				Expect(*logLevel).To(Equal("fatal"))
+			})
+
+			It("adds the marker to no run of the SSH daemon outside the main action of a VM container", func() {
 				container.ExecutionBackend = "vm-qemu"
 				container.Setup = &models.Action{RunAction: &models.RunAction{Path: "/setup/path"}}
 				container.Action = &models.Action{RunAction: &models.RunAction{Path: "/action/path", Args: []string{"app"}}}

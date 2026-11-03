@@ -150,7 +150,7 @@ var _ = Describe("SSH daemon with a guest agent", func() {
 		Expect(io.ReadAll(conn)).To(Equal([]byte(text)))
 	}
 
-	Context("when the executor passes -vmContainer, as it does in the main action of a VM container", func() {
+	Context("when the executor appends the vm-container marker, as it does in the main action of a VM container", func() {
 		BeforeEach(func() {
 			vmContainer = true
 		})
@@ -182,7 +182,7 @@ var _ = Describe("SSH daemon with a guest agent", func() {
 		})
 	})
 
-	Context("when the executor does not pass -vmContainer, though a socket at the relay's path answers ok, as an app in a runC or gVisor container could make one", func() {
+	Context("when the executor appends no marker, though a socket at the relay's path answers ok, as an app in a runC or gVisor container could make one", func() {
 		BeforeEach(func() {
 			startRelay()
 		})

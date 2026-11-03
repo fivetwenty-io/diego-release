@@ -81,8 +81,21 @@ var allowedHostKeyAlgorithms = flag.String(
 var vmContainer = flag.Bool(
 	"vmContainer",
 	false,
-	"Serve scp, sftp, and forwards through the guest agent of the VM that runs the app, as the executor passes in VM containers only",
+	"Serve scp, sftp, and forwards through the guest agent of the VM that runs the app. The daemon passes this to itself when it re-executes. The executor marks a VM container with the trailing argument "+vmContainerMarker+" instead",
 )
+
+// vmContainerMarker is the trailing positional argument with which the
+// executor marks the main action of a VM container. It is not a flag, so that
+// a diego-sshd from before the marker existed ignores it.
+const vmContainerMarker = "vm-container"
+
+// inVMContainer reports whether the executor marked this container as a VM
+// container. Only the bare marker as the one positional argument counts, and
+// the flag package stops at the first positional argument, so any other
+// argument that follows it makes the daemon serve as in a runC container.
+func inVMContainer(flagSet *flag.FlagSet) bool {
+	return *vmContainer || (flagSet.NArg() == 1 && flagSet.Arg(0) == vmContainerMarker)
+}
 
 var hostKeyPEM string
 var authorizedKeyValue string
@@ -91,6 +104,7 @@ func runServer() error {
 	debugserver.AddFlags(flag.CommandLine)
 	lagerflags.AddFlags(flag.CommandLine)
 	flag.Parse()
+	vmMarked := inVMContainer(flag.CommandLine)
 	exec := false
 
 	logger, reconfigurableSink := lagerflags.New("sshd")
@@ -147,7 +161,7 @@ func runServer() error {
 			fmt.Sprintf("--allowedMACs=%s", *allowedMACs),
 			fmt.Sprintf("--allowedHostKeyAlgorithms=%s", *allowedHostKeyAlgorithms),
 			fmt.Sprintf("--logLevel=%s", logLevel),
-			fmt.Sprintf("--vmContainer=%t", *vmContainer),
+			fmt.Sprintf("--vmContainer=%t", vmMarked),
 			fmt.Sprintf("--debugAddr=%s", debugserver.DebugAddress(flag.CommandLine)),
 		}, os.Environ())
 		if err != nil {
@@ -164,7 +178,7 @@ func runServer() error {
 
 	runner := handlers.NewCommandRunner()
 	shellLocator := handlers.NewShellLocator()
-	sessionHandler, directTcpipHandler := newChannelHandlers(runner, shellLocator, getDaemonEnvironment(), 15*time.Second, *vmContainer)
+	sessionHandler, directTcpipHandler := newChannelHandlers(runner, shellLocator, getDaemonEnvironment(), 15*time.Second, vmMarked)
 
 	sshDaemon := daemon.New(
 		logger,

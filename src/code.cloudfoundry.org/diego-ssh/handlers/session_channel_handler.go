@@ -10,9 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"code.cloudfoundry.org/diego-ssh/helpers"
 	"code.cloudfoundry.org/diego-ssh/scp"
@@ -452,7 +454,14 @@ func (sess *session) refuseTransfer(logger lager.Logger, request *ssh.Request, t
 		}
 	}
 
-	_, _ = fmt.Fprintf(sess.channel.Stderr(), "%s is not available right now, because the guest agent of this app's VM is not answering (%v). Try again shortly.\n", transfer, reason)
+	// The reason can carry text from the guest, so drop control characters.
+	printable := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, reason.Error())
+	_, _ = fmt.Fprintf(sess.channel.Stderr(), "%s is not available right now, because the guest agent of this app's VM is not answering (%s). Try again shortly.\n", transfer, printable)
 	sess.sendSCPExitMessage(reason)
 	sess.destroy()
 }

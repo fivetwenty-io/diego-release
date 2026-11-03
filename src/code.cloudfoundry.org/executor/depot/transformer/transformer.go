@@ -74,7 +74,7 @@ type transformer struct {
 
 	// vmAction marks the copy of the transformer that builds the main action
 	// of a VM container. Its run steps pass the stop grace interval, and its
-	// runs of the SSH daemon get executor.SSHDVMContainerFlag.
+	// runs of the SSH daemon get executor.SSHDVMContainerMarker.
 	vmAction bool
 }
 
@@ -177,7 +177,7 @@ func (t *transformer) stepFor(
 	case *models.RunAction:
 		model := *actionModel
 		if t.vmAction && model.Path == executor.SSHDPath {
-			model.Args = append(append([]string{}, model.Args...), executor.SSHDVMContainerFlag)
+			model.Args = append(append([]string{}, model.Args...), executor.SSHDVMContainerMarker)
 		}
 		runStep := steps.NewRun(
 			container,

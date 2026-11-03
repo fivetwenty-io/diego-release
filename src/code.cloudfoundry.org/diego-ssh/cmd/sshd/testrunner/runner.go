@@ -33,9 +33,10 @@ func (args Args) ArgSlice() []string {
 		"-allowUnauthenticatedClients=" + strconv.FormatBool(args.AllowUnauthenticatedClients),
 		"-inheritDaemonEnv=" + strconv.FormatBool(args.InheritDaemonEnv),
 	}
-	// The executor appends the flag bare, and only in a VM container.
+	// The executor appends the marker as a bare trailing word, and only in a
+	// VM container.
 	if args.VMContainer {
-		argSlice = append(argSlice, "-vmContainer")
+		argSlice = append(argSlice, "vm-container")
 	}
 	return argSlice
 }
